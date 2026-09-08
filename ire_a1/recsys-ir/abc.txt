@@ -1,0 +1,1110 @@
+src/
+├── common
+│   ├── __init__.py
+│   ├── logging_utils.py
+│   ├── paths.py
+│   └── schema.py
+├── evaluation
+│   ├── beyond_accuracy.py
+│   ├── bootstrap.py
+│   ├── candidate_pool_sizes.py
+│   ├── compare_retrievers.py
+│   ├── __init__.py
+│   ├── leakage_test.py
+│   ├── ranking_metrics.py
+│   ├── run_eval.py
+│   └── slicing.py
+├── feature_store
+│   ├── article_store.py
+│   ├── build_features.py
+│   ├── history_store.py
+│   ├── __init__.py
+│   ├── large_user_store.py
+│   ├── store_backend.py
+│   └── user_store.py
+├── ingestion
+│   ├── checksums.py
+│   ├── download_ebnerd.py
+│   ├── download_large.py
+│   ├── download_mind.py
+│   └── __init__.py
+├── __init__.py
+├── parsing
+│   ├── __init__.py
+│   ├── parse_ebnerd.py
+│   ├── parse_mind.py
+│   └── submission_readers.py
+├── retrieval
+│   ├── ann.py
+│   ├── bm25.py
+│   ├── candidate_gen.py
+│   ├── embeddings.py
+│   ├── hybrid_rerank.py
+│   ├── __init__.py
+│   ├── run_bm25.py
+│   ├── run_embeddings.py
+│   └── user_representation.py
+├── splitting
+│   ├── __init__.py
+│   └── temporal_split.py
+└── submission
+    ├── __init__.py
+    ├── make_submission.py
+    ├── package_submission.py
+    └── writers.py
+
+9 directories, 45 files
+./scripts/eval_attention_full.py
+./scripts/train_attention_fast.py
+./scripts/train_attention_ranker.py
+./scripts/tune_query_key_attention.py
+./scripts/generate_attention_submission.py
+./tests/test_ranking_metrics.py
+./src/evaluation/ranking_metrics.py
+./src/retrieval/hybrid_rerank.py
+./results/large/qk_attention_tuning.csv
+"""Article feature store - cleaned text, category, entities, embedding pointer.
+
+Builds per-article features from the interim articles table and exposes them
+via DuckDB-backed selective reads.
+
+Feature columns:
+  - article_id:    primary key (str)
+  - dataset:       "mind" | "ebnerd"
+  - cleaned_text:  title + " " + abstract  (for BM25 — the confirmed required scope).
+                   Body text stays available on the underlying interim article record
+                   for the optional ablation later, but is NOT part of this default
+                   cleaned-text feature.
+  - category:      pass-through from interim
+  - subcategory:   pass-through from interim
+  - entities:      pass-through JSON string
+  - embedding_ref: lazy pointer to its embedding row (never materialized here)
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any, Optional
+
+import polars as pl
+
+from src.feature_store.store_backend import ParquetStore
+
+logger = logging.getLogger(__name__)
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class ArticleFeatureStore:
+    """Query layer over article features backed by Parquet + DuckDB.
+
+    Typical usage::
+
+        store = ArticleFeatureStore("mind")
+        row = store.get_article("N12345")
+        bm25_df = store.get_articles_for_bm25()
+    """
+
+    FEATURE_COLUMNS = [
+        "article_id",
+        "dataset",
+        "cleaned_text",
+        "category",
+        "subcategory",
+        "entities",
+        "embedding_ref",
+    ]
+
+    def __init__(self, dataset: str, processed_dir: Path | None = None, scale: str = "small") -> None:
+        if processed_dir is None:
+            from src.common.paths import processed_dir as scale_processed_dir
+            processed_dir = scale_processed_dir(dataset, scale)
+        self._path = processed_dir / "article_features.parquet"
+        if not self._path.exists():
+            raise FileNotFoundError(
+                f"Article features not found at {self._path}. "
+                f"Run `python -m src.feature_store.build_features --dataset {dataset}` first."
+            )
+        self._store = ParquetStore(self._path, table_alias="articles")
+        self._dataset = dataset
+
+    # Lookups
+
+    def get_article(self, article_id: str) -> dict[str, Any] | None:
+        """Return all feature columns for a single article, or ``None``."""
+        return self._store.get_by_id("article_id", article_id)
+
+    def get_articles_batch(
+        self, article_ids: list[str], columns: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Return features for a batch of article IDs."""
+        return self._store.batch_get("article_id", article_ids, columns=columns)
+
+    def get_articles_for_bm25(
+        self, article_ids: list[str] | None = None
+    ) -> pl.DataFrame:
+        """Return ``(article_id, cleaned_text)`` for BM25 indexing.
+
+        If *article_ids* is provided, only those articles are returned.
+        Otherwise, all articles in the store are returned.
+        """
+        cols = ["article_id", "cleaned_text"]
+        if article_ids is None:
+            return self._store.get_dataframe(columns=cols)
+        # Use batch lookup for selective read
+        return self._store.get_dataframe(
+            columns=cols,
+            where=f"article_id IN ({','.join(['$' + str(i+1) for i in range(len(article_ids))])})",
+            params=article_ids,
+        )
+
+    def get_article_metadata(self, article_id: str) -> dict[str, Any] | None:
+        """Return category, entities, embedding_ref for an article."""
+        return self._store.get_by_id(
+            "article_id",
+            article_id,
+            columns=["article_id", "category", "subcategory", "entities", "embedding_ref"],
+        )
+
+    @property
+    def row_count(self) -> int:
+        return self._store.row_count()
+
+    # Build step
+
+    @staticmethod
+    def build_features(
+        dataset: str,
+        interim_dir: Path | None = None,
+        processed_dir: Path | None = None,
+    ) -> Path:
+        """Read interim articles and write article_features.parquet.
+
+        Parameters
+        ----------
+        dataset : str
+            ``"mind"`` or ``"ebnerd"``.
+        interim_dir : Path, optional
+            Override for ``data/interim/{dataset}/``.
+        processed_dir : Path, optional
+            Override for ``data/processed/{dataset}/``.
+
+        Returns
+        -------
+        Path
+            Path to the written Parquet file.
+        """
+        if interim_dir is None:
+            interim_dir = _PROJECT_ROOT / "data" / "interim" / dataset
+        if processed_dir is None:
+            processed_dir = _PROJECT_ROOT / "data" / "processed" / dataset
+
+        articles_path = interim_dir / "articles.parquet"
+        if not articles_path.exists():
+            raise FileNotFoundError(
+                f"Interim articles not found at {articles_path}. "
+                f"Run parse_{dataset} first."
+            )
+
+        logger.info("Building article features for %s from %s", dataset, articles_path)
+        df = pl.read_parquet(articles_path)
+        logger.info("  Read %d articles", len(df))
+
+        # Build cleaned_text = title + " " + abstract
+        # Handle nulls: if abstract is null, cleaned_text = title only.
+        # Body text stays available on the interim record but is NOT part of
+        # cleaned_text — body is optional/extra-credit scope.
+        df = df.with_columns(
+            pl.when(pl.col("abstract").is_not_null())
+            .then(pl.col("title") + pl.lit(" ") + pl.col("abstract"))
+            .otherwise(pl.col("title"))
+            .alias("cleaned_text")
+        )
+
+        # Select only the feature columns
+        feature_df = df.select([
+            "article_id",
+            "dataset",
+            "cleaned_text",
+            "category",
+            "subcategory",
+            "entities",
+            "embedding_ref",
+        ])
+
+        # Write to processed dir
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        out_path = processed_dir / "article_features.parquet"
+        feature_df.write_parquet(out_path)
+
+        logger.info(
+            "  Wrote article features: %d rows → %s (%.1f MB)",
+            len(feature_df),
+            out_path,
+            out_path.stat().st_size / 1024**2,
+        )
+        return out_path
+"""Build memory-safe feature stores for small and large pipelines."""
+from __future__ import annotations
+
+import argparse
+import logging
+import time
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+def build_all(datasets: list[str] | None = None, scale: str = "small") -> dict[str, dict[str, Path]]:
+    from src.common.paths import interim_dir, processed_dir
+    from src.feature_store.article_store import ArticleFeatureStore
+    from src.feature_store.user_store import UserFeatureStore
+    from src.feature_store.history_store import MemoryMappedHistoryStore
+
+    datasets = datasets or ["mind", "ebnerd"]
+    results: dict[str, dict[str, Path]] = {}
+
+    for dataset in datasets:
+        i_dir = interim_dir(dataset, scale)
+        p_dir = processed_dir(dataset, scale)
+        if not i_dir.exists():
+            logger.warning("Skipping %s: %s does not exist", dataset, i_dir)
+            continue
+        p_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+
+        article_path = ArticleFeatureStore.build_features(
+            dataset, interim_dir=i_dir, processed_dir=p_dir
+        )
+        result = {"articles": article_path}
+
+        if scale == "large" and dataset == "ebnerd":
+            raw_root = Path(__file__).resolve().parents[2] / "data" / "raw" / "ebnerd" / "ebnerd_large"
+            # Validation-time history must remain separate from training history.
+            for split in ("train", "validation"):
+                source = raw_root / split / "history.parquet"
+                if source.exists():
+                    index_dir = p_dir / f"history_index_{split}"
+                    MemoryMappedHistoryStore.build(source, index_dir)
+                    result[f"history_{split}"] = index_dir
+            # A user_features file is intentionally not built from 25M behavior
+            # rows. The large EB history index is the serving-time user feature store.
+            logger.info("Large EB-NeRD user feature store: memory-mapped history indexes")
+        elif scale == "large" and dataset == "mind":
+            # MIND-large has per-impression history snapshots. Retrieval reads
+            # them directly from behaviors.parquet; no giant per-user aggregate is
+            # needed and no future interactions are introduced by aggregation.
+            logger.info("Large MIND user features: per-impression history snapshots")
+        else:
+            result["users"] = UserFeatureStore.build_features(
+                dataset, interim_dir=i_dir, processed_dir=p_dir
+            )
+
+        logger.info("Built %s features in %.1fs", dataset, time.time() - t0)
+        results[dataset] = result
+
+    return results
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", choices=["mind", "ebnerd", "all"], default="all")
+    parser.add_argument("--scale", choices=["small", "large"], default="small")
+    args = parser.parse_args()
+    datasets = ["mind", "ebnerd"] if args.dataset == "all" else [args.dataset]
+    results = build_all(datasets, scale=args.scale)
+    for ds, paths in results.items():
+        print(f"\n{ds.upper()}:")
+        for name, path in paths.items():
+            if path.is_file():
+                print(f"  {name}: {path.name} ({path.stat().st_size / 1024**2:.1f} MB)")
+            else:
+                print(f"  {name}: {path}")
+
+
+if __name__ == "__main__":
+    main()
+"""Compact, memory-mapped EB-NeRD history index for large-scale inference.
+
+The provided test `history.parquet` contains one row per user with list-valued
+article IDs and timestamps. Expanding the complete file into Python dictionaries
+would be prohibitively memory-heavy. This module builds a compact three-array
+index once and memory-maps it during inference:
+
+    user_ids.npy       sorted user IDs
+    offsets.npy        row boundaries into the flattened arrays
+    article_ids.npy    flattened clicked article IDs
+    timestamps.npy     flattened click timestamps (Unix seconds)
+
+This keeps inference RAM roughly constant and makes history lookup O(log U + H).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import pyarrow.parquet as pq
+
+logger = logging.getLogger(__name__)
+
+
+class MemoryMappedHistoryStore:
+    """Read EB-NeRD user histories from compact memory-mapped arrays."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = Path(directory)
+        self.user_ids = np.load(self.directory / "user_ids.npy", mmap_mode="r")
+        self.offsets = np.load(self.directory / "offsets.npy", mmap_mode="r")
+        self.article_ids = np.load(self.directory / "article_ids.npy", mmap_mode="r")
+        self.timestamps = np.load(self.directory / "timestamps.npy", mmap_mode="r")
+
+    @classmethod
+    def build(cls, history_path: Path, output_dir: Path, force: bool = False) -> "MemoryMappedHistoryStore":
+        output_dir.mkdir(parents=True, exist_ok=True)
+        required = ["user_ids.npy", "offsets.npy", "article_ids.npy", "timestamps.npy", "metadata.json"]
+        if not force and all((output_dir / name).exists() for name in required):
+            logger.info("Loading existing EB-NeRD history index from %s", output_dir)
+            return cls(output_dir)
+
+        logger.info("Building compact history index from %s", history_path)
+        parquet = pq.ParquetFile(history_path)
+        total_users = parquet.metadata.num_rows
+
+        total_clicks = 0
+        for batch in parquet.iter_batches(batch_size=50_000, columns=["article_id_fixed"]):
+            values = batch.column(0).to_pylist()
+            total_clicks += sum(len(v or []) for v in values)
+        logger.info("History index dimensions: %d users, %d clicks", total_users, total_clicks)
+
+        user_ids = np.empty(total_users, dtype=np.int64)
+        offsets = np.empty(total_users + 1, dtype=np.int64)
+        article_ids = np.empty(total_clicks, dtype=np.int64)
+        timestamps = np.empty(total_clicks, dtype=np.int64)
+
+        user_pos = 0
+        click_pos = 0
+        offsets[0] = 0
+        for batch in parquet.iter_batches(
+            batch_size=20_000,
+            columns=["user_id", "impression_time_fixed", "article_id_fixed"],
+        ):
+            user_col = batch.column(0).to_pylist()
+            time_col = batch.column(1).to_pylist()
+            article_col = batch.column(2).to_pylist()
+            for uid, times, articles in zip(user_col, time_col, article_col):
+                if user_pos >= total_users:
+                    raise RuntimeError("History row count changed during index build")
+                articles = articles or []
+                times = times or []
+                user_ids[user_pos] = int(uid)
+                for j, aid in enumerate(articles):
+                    article_ids[click_pos] = int(aid)
+                    ts = times[j] if j < len(times) else None
+                    if ts is None:
+                        timestamps[click_pos] = -1
+                    else:
+                        # Arrow returns datetime-like Python objects here.
+                        dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        timestamps[click_pos] = int(dt.timestamp())
+                    click_pos += 1
+                user_pos += 1
+                offsets[user_pos] = click_pos
+
+        if user_pos != total_users or click_pos != total_clicks:
+            raise RuntimeError(
+                f"History index count mismatch: users {user_pos}/{total_users}, "
+                f"clicks {click_pos}/{total_clicks}"
+            )
+
+        # Binary-search lookup requires sorted user IDs. Avoid a full reorder when
+        # the source history is already sorted (which is common for EB-NeRD files).
+        if np.all(user_ids[:-1] <= user_ids[1:]):
+            sorted_users = user_ids
+            sorted_offsets = offsets
+            sorted_article_ids = article_ids
+            sorted_timestamps = timestamps
+        else:
+            order = np.argsort(user_ids, kind="stable")
+            sorted_users = user_ids[order]
+            sorted_offsets = np.empty_like(offsets)
+            sorted_article_ids = np.empty_like(article_ids)
+            sorted_timestamps = np.empty_like(timestamps)
+            out_pos = 0
+            sorted_offsets[0] = 0
+            for i, original_idx in enumerate(order):
+                start, end = offsets[original_idx], offsets[original_idx + 1]
+                length = int(end - start)
+                if length:
+                    sorted_article_ids[out_pos:out_pos + length] = article_ids[start:end]
+                    sorted_timestamps[out_pos:out_pos + length] = timestamps[start:end]
+                out_pos += length
+                sorted_offsets[i + 1] = out_pos
+
+        np.save(output_dir / "user_ids.npy", sorted_users)
+        np.save(output_dir / "offsets.npy", sorted_offsets)
+        np.save(output_dir / "article_ids.npy", sorted_article_ids)
+        np.save(output_dir / "timestamps.npy", sorted_timestamps)
+        metadata = {
+            "source": str(history_path),
+            "users": int(total_users),
+            "clicks": int(total_clicks),
+        }
+        (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+        logger.info("History index built at %s", output_dir)
+        return cls(output_dir)
+
+    def get_history(self, user_id: str | int, cutoff: datetime | None = None) -> list[dict[str, str | None]]:
+        uid = int(user_id)
+        pos = int(np.searchsorted(self.user_ids, uid))
+        if pos >= len(self.user_ids) or int(self.user_ids[pos]) != uid:
+            return []
+        start = int(self.offsets[pos])
+        end = int(self.offsets[pos + 1])
+        if end <= start:
+            return []
+
+        cutoff_epoch = None
+        if cutoff is not None:
+            if cutoff.tzinfo is None:
+                cutoff = cutoff.replace(tzinfo=timezone.utc)
+            cutoff_epoch = int(cutoff.timestamp())
+
+        out: list[dict[str, str | None]] = []
+        for aid, ts in zip(self.article_ids[start:end], self.timestamps[start:end]):
+            ts_int = int(ts)
+            if cutoff_epoch is not None and ts_int >= 0 and ts_int >= cutoff_epoch:
+                continue
+            if ts_int < 0:
+                clicked_at = None
+            else:
+                clicked_at = datetime.fromtimestamp(ts_int, tz=timezone.utc).replace(tzinfo=None).isoformat()
+            out.append({"article_id": str(int(aid)), "clicked_at": clicked_at})
+        return out
+
+    def get_histories(self, user_ids: list[str], cutoffs: list[datetime | None]) -> list[list[dict[str, str | None]]]:
+        if len(user_ids) != len(cutoffs):
+            raise ValueError("user_ids and cutoffs must have equal length")
+        return [self.get_history(uid, cutoff) for uid, cutoff in zip(user_ids, cutoffs)]
+"""Scale-aware user feature stores for the large datasets.
+
+The logical user-feature interface is shared by offline retrieval and
+Codabench inference, but the physical representation differs by dataset:
+
+* MIND-large: the behavior row already contains the as-of-impression history
+  snapshot, so we expose that snapshot directly without duplicating it into a
+  second 2.6M-row table.
+* EB-NeRD-large: the compact MemoryMappedHistoryStore provides timestamped
+  lifetime history; this class adds the strict as-of filtering and recency
+  weights required at serving time.
+
+This module deliberately reuses the large artifacts already produced by the
+pipeline; it does not require reparsing the datasets.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+import math
+from pathlib import Path
+from typing import Any
+
+from src.feature_store.history_store import MemoryMappedHistoryStore
+
+
+DECAY_LAMBDA = 1.0 / (7 * 86400)
+
+
+class MindLargeUserFeatureStore:
+    """Logical user-feature store backed by impression-level MIND snapshots."""
+
+    @staticmethod
+    def from_behavior_row(row: dict[str, Any]) -> dict[str, Any]:
+        import json
+
+        raw_history = row.get("clicked_history")
+        if raw_history is None:
+            history: list[dict[str, Any]] = []
+        elif isinstance(raw_history, str):
+            history = json.loads(raw_history) if raw_history else []
+        else:
+            history = list(raw_history)
+
+        return {
+            "user_id": str(row["user_id"]),
+            "impression_id": str(row["impression_id"]),
+            "history": history,
+            "history_len": len(history),
+            "recency_weights": [1.0] * len(history),
+            "last_click_at": None,
+        }
+
+
+class EbnerdLargeUserFeatureStore:
+    """User features backed by a memory-mapped timestamped history index."""
+
+    def __init__(self, index_dir: Path) -> None:
+        self.history_store = MemoryMappedHistoryStore(index_dir)
+
+    def get_features(
+        self,
+        user_id: str | int,
+        as_of_ts: datetime,
+    ) -> dict[str, Any]:
+        history = self.history_store.get_history(user_id, as_of_ts)
+
+        weights: list[float] = []
+        last_click_at: str | None = None
+
+        for entry in history:
+            clicked_at = entry.get("clicked_at")
+            if clicked_at is None:
+                weights.append(1.0)
+                continue
+
+            clicked_dt = datetime.fromisoformat(clicked_at)
+            delta = max((as_of_ts - clicked_dt).total_seconds(), 0.0)
+            weights.append(float(math.exp(-DECAY_LAMBDA * delta)))
+            if last_click_at is None or clicked_at > last_click_at:
+                last_click_at = clicked_at
+
+        return {
+            "user_id": str(user_id),
+            "history": history,
+            "history_len": len(history),
+            "recency_weights": weights,
+            "last_click_at": last_click_at,
+        }
+
+
+class LargeUserFeatureStore:
+    """Factory exposing the dataset-specific large user-feature store."""
+
+    def __init__(self, dataset: str, processed_dir: Path) -> None:
+        if dataset == "ebnerd":
+            self.dataset = dataset
+            index_dir = processed_dir / "history_index_validation"
+            if not index_dir.exists():
+                raise FileNotFoundError(
+                    f"EB-NeRD validation history index not found: {index_dir}"
+                )
+            self._store = EbnerdLargeUserFeatureStore(index_dir)
+        elif dataset == "mind":
+            self.dataset = dataset
+            self._store = MindLargeUserFeatureStore()
+        else:
+            raise ValueError(f"Unsupported large user-feature dataset: {dataset}")
+
+    def from_behavior_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        if self.dataset != "mind":
+            raise TypeError("from_behavior_row is only valid for MIND")
+        return self._store.from_behavior_row(row)
+
+    def get_features(
+        self,
+        user_id: str | int,
+        as_of_ts: datetime,
+    ) -> dict[str, Any]:
+        if self.dataset != "ebnerd":
+            raise TypeError("get_features is only valid for EB-NeRD")
+        return self._store.get_features(user_id, as_of_ts)
+"""Swappable storage backend for feature stores - Parquet + DuckDB.
+
+Provides a thin wrapper around DuckDB's ability to read Parquet files
+directly, giving columnar-efficient selective reads (e.g. only
+``title``/``abstract`` for BM25, only ``embedding`` for ANN) plus
+SQL-style filtering - without loading the entire file into memory.
+
+Design rationale (vs. alternatives):
+  - Plain pickled pandas: loses columnar efficiency, forces load-everything.
+  - SQLite: loses columnar read efficiency for wide text/embedding columns,
+    adds unneeded write-lock contention.
+  - Full feature-store framework (Feast): correct shape for production, but
+    overkill setup/learning cost for an assignment.
+  - Parquet + DuckDB: no server process, one pure-Python-installable dep,
+    fast selective reads, SQL-style time-filtered joins, no ingestion step.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any, Optional
+
+import duckdb
+import polars as pl
+
+logger = logging.getLogger(__name__)
+
+
+class ParquetStore:
+    """Thin query layer over a single Parquet file via DuckDB.
+
+    DuckDB reads the Parquet file on demand - no full materialization at
+    init time.  Column projection and filter pushdown happen inside DuckDB's
+    engine, so only the requested data is scanned.
+
+    Parameters
+    ----------
+    parquet_path : Path
+        Absolute or relative path to the ``.parquet`` file.
+    table_alias : str, optional
+        SQL alias for the Parquet view (default: ``"t"``).
+    """
+
+    def __init__(self, parquet_path: Path | str, table_alias: str = "t") -> None:
+        self.parquet_path = Path(parquet_path)
+        if not self.parquet_path.exists():
+            raise FileNotFoundError(f"Parquet file not found: {self.parquet_path}")
+
+        self.alias = table_alias
+        # In-memory DuckDB connection - no file, no write-lock.
+        self._con = duckdb.connect(database=":memory:")
+        # Register the Parquet as a view for convenient SQL access.
+        self._con.execute(
+            f"CREATE VIEW {self.alias} AS SELECT * FROM read_parquet('{self.parquet_path}')"
+        )
+        logger.debug("ParquetStore opened: %s (alias=%s)", self.parquet_path, self.alias)
+
+    # Single-row lookup
+
+    def get_by_id(
+        self,
+        id_col: str,
+        id_val: str,
+        columns: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a single row matching ``id_col == id_val``, or ``None``.
+
+        Parameters
+        ----------
+        id_col : str
+            Primary-key column name.
+        id_val : str
+            Value to match.
+        columns : list[str], optional
+            Column projection; all columns if ``None``.
+        """
+        cols = ", ".join(columns) if columns else "*"
+        sql = f"SELECT {cols} FROM {self.alias} WHERE {id_col} = $1 LIMIT 1"
+        result = self._con.execute(sql, [id_val]).fetchone()
+        if result is None:
+            return None
+        col_names = [desc[0] for desc in self._con.description]
+        return dict(zip(col_names, result))
+
+    # Batch lookup
+
+    def batch_get(
+        self,
+        id_col: str,
+        id_vals: list[str],
+        columns: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return rows matching ``id_col IN (id_vals)``.
+
+        Parameters
+        ----------
+        id_col : str
+            Column to filter on.
+        id_vals : list[str]
+            Values to match.
+        columns : list[str], optional
+            Column projection.
+        """
+        if not id_vals:
+            return []
+        cols = ", ".join(columns) if columns else "*"
+        placeholders = ", ".join(["$" + str(i + 1) for i in range(len(id_vals))])
+        sql = f"SELECT {cols} FROM {self.alias} WHERE {id_col} IN ({placeholders})"
+        rows = self._con.execute(sql, id_vals).fetchall()
+        col_names = [desc[0] for desc in self._con.description]
+        return [dict(zip(col_names, row)) for row in rows]
+
+    # Arbitrary SQL escape hatch
+
+    def query_sql(
+        self,
+        sql: str,
+        params: list | None = None,
+    ) -> list[dict[str, Any]]:
+        """Execute arbitrary SQL and return results as list of dicts.
+
+        The Parquet view is available as ``self.alias`` (default ``"t"``).
+        """
+        result = self._con.execute(sql, params or [])
+        if result.description is None:
+            return []
+        col_names = [desc[0] for desc in result.description]
+        return [dict(zip(col_names, row)) for row in result.fetchall()]
+
+    # Bulk read into Polars
+
+    def get_dataframe(
+        self,
+        columns: list[str] | None = None,
+        where: str | None = None,
+        params: list | None = None,
+    ) -> pl.DataFrame:
+        """Read (optionally filtered) data into a Polars DataFrame.
+
+        Parameters
+        ----------
+        columns : list[str], optional
+            Column projection.
+        where : str, optional
+            SQL WHERE clause (without the ``WHERE`` keyword), e.g.
+            ``"dataset = 'mind'"``.
+        params : list, optional
+            Positional parameters for the WHERE clause.
+        """
+        cols = ", ".join(columns) if columns else "*"
+        sql = f"SELECT {cols} FROM {self.alias}"
+        if where:
+            sql += f" WHERE {where}"
+        result = self._con.execute(sql, params or [])
+        # Fetch as Arrow, then zero-copy into Polars.
+        arrow_table = result.fetch_arrow_table()
+        return pl.from_arrow(arrow_table)
+
+    # Metadata
+
+    def row_count(self) -> int:
+        """Return the total number of rows."""
+        result = self._con.execute(f"SELECT COUNT(*) FROM {self.alias}").fetchone()
+        return result[0] if result else 0
+
+    def columns(self) -> list[str]:
+        """Return the list of column names."""
+        result = self._con.execute(f"SELECT * FROM {self.alias} LIMIT 0")
+        return [desc[0] for desc in result.description]
+
+    def close(self) -> None:
+        """Close the DuckDB connection."""
+        self._con.close()
+
+    def __repr__(self) -> str:
+        return f"ParquetStore({self.parquet_path}, rows={self.row_count()})"
+"""User feature store - click history, recency-decayed weights, history length.
+
+Builds per-user features from the interim behaviors table and exposes them
+via DuckDB-backed selective reads.  The critical method is
+``get_user_history(user_id, as_of_ts, dataset)`` which performs
+timestamp-aware filtering to prevent data leakage.
+
+IMPORTANT — dataset-specific handling (confirmed by EDA_SUMMARY.md):
+  - EB-NeRD: ``clicked_history[]`` carries real per-click timestamps from
+    ``history.parquet``'s ``impression_time_fixed``.  ``as_of_ts`` filtering
+    is the ACTUAL leakage-prevention mechanism — the filter strictly excludes
+    any history entry with ``clicked_at >= as_of_ts``.
+  - MIND: ``clicked_history[]`` has no per-item timestamps.  It was already a
+    pre-trimmed, as-of-impression snapshot at parsing time (per MIND's own
+    ``behaviors.tsv`` design).  ``as_of_ts`` filtering is a pass-through
+    (nothing to filter, since there's no timestamp to filter on).
+
+    DOCUMENTED ASSUMPTION (carried from parse_mind.py): MIND's leakage guard
+    is enforced upstream by the dataset's own construction, not by this
+    function.  This is a documented assumption, not a verified guarantee —
+    MIND provides no per-article published_time to independently check it.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+import polars as pl
+
+from src.feature_store.store_backend import ParquetStore
+
+logger = logging.getLogger(__name__)
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Recency decay constant: λ = 1 / (7 * 86400) → ~7-day half-life.
+# weight_i = exp(-λ * (as_of_ts - clicked_at_i).total_seconds())
+_DECAY_LAMBDA = 1.0 / (7 * 86400)
+
+
+class UserFeatureStore:
+    """Query layer over user features backed by Parquet + DuckDB.
+
+    Typical usage::
+
+        store = UserFeatureStore("mind")
+        history = store.get_user_history("U123", as_of_ts, "mind")
+        features = store.get_user_features("U123", as_of_ts, "mind")
+    """
+
+    def __init__(self, dataset: str, processed_dir: Path | None = None, scale: str = "small") -> None:
+        if processed_dir is None:
+            from src.common.paths import processed_dir as scale_processed_dir
+            processed_dir = scale_processed_dir(dataset, scale)
+        self._path = processed_dir / "user_features.parquet"
+        if not self._path.exists():
+            raise FileNotFoundError(
+                f"User features not found at {self._path}. "
+                f"Run `python -m src.feature_store.build_features --dataset {dataset}` first."
+            )
+        self._store = ParquetStore(self._path, table_alias="users")
+        self._dataset = dataset
+
+    # Core history retrieval
+
+    def get_user_history(
+        self,
+        user_id: str,
+        as_of_ts: datetime,
+        dataset: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return a user's click history filtered to entries BEFORE ``as_of_ts``.
+
+        Parameters
+        ----------
+        user_id : str
+            User ID to look up.
+        as_of_ts : datetime
+            Timestamp cutoff for filtering.
+        dataset : str, optional
+            ``"mind"`` or ``"ebnerd"``.  Defaults to the store's dataset.
+
+        Returns
+        -------
+        list[dict]
+            List of ``{article_id: str, clicked_at: str | None}`` dicts,
+            ordered chronologically (oldest first), filtered according to
+            dataset-specific rules.
+
+        Dataset-specific filtering
+        --------------------------
+        EB-NeRD:
+            Strictly excludes any history entry with ``clicked_at >= as_of_ts``.
+            This is the ACTUAL leakage-prevention mechanism — EB-NeRD's
+            ``clicked_history[]`` carries real per-click timestamps from
+            ``history.parquet``'s ``impression_time_fixed``, representing the
+            user's FULL lifetime history.
+
+        MIND:
+            Returns the full snapshot unchanged (pass-through / no-op).
+            MIND's ``clicked_history[]`` has no per-item timestamps — it was
+            already a pre-trimmed, as-of-impression snapshot at parsing time
+            (per MIND's own ``behaviors.tsv`` design).
+
+            DOCUMENTED ASSUMPTION: MIND's leakage guard is enforced upstream
+            by the dataset's own construction, not by this function.  This is
+            a documented assumption, not a verified guarantee — MIND provides
+            no per-article published_time to independently check it.  This
+            caveat is flagged identically in ``parse_mind.py``.
+        """
+        ds = dataset or self._dataset
+
+        # Look up the user's full history from the feature store.
+        row = self._store.get_by_id("user_id", user_id, columns=["all_history"])
+        if row is None:
+            return []
+
+        all_history = json.loads(row["all_history"])
+
+        if ds == "mind":
+            # MIND: pass-through — no timestamps to filter on.
+            # Leakage guard is enforced upstream by MIND's own construction
+            # (each behaviors.tsv row's history column is a pre-trimmed snapshot).
+            # See module docstring and parse_mind.py for the documented caveat.
+            return all_history
+
+        # EB-NeRD: filter strictly — exclude any entry with clicked_at >= as_of_ts.
+        # This is the real leakage-prevention mechanism.
+        filtered = []
+        for entry in all_history:
+            clicked_at_str = entry.get("clicked_at")
+            if clicked_at_str is None:
+                # Defensive: if an EB-NeRD entry somehow has no timestamp,
+                # include it (conservative — same as MIND path).
+                filtered.append(entry)
+                continue
+            # Parse ISO datetime string
+            clicked_at = datetime.fromisoformat(clicked_at_str)
+            if clicked_at < as_of_ts:
+                filtered.append(entry)
+            # else: clicked_at >= as_of_ts → excluded (leakage prevention)
+
+        return filtered
+
+    # Enriched features
+
+    def get_user_features(
+        self,
+        user_id: str,
+        as_of_ts: datetime,
+        dataset: str | None = None,
+    ) -> dict[str, Any]:
+        """Return filtered history + recency-decayed weights + history length.
+
+        Returns
+        -------
+        dict with keys:
+          - user_id: str
+          - history: list[dict]  (filtered by as_of_ts)
+          - history_len: int
+          - recency_weights: list[float]  (parallel to history)
+          - last_click_at: str | None
+        """
+        ds = dataset or self._dataset
+        history = self.get_user_history(user_id, as_of_ts, ds)
+
+        # Compute recency-decayed weights.
+        # For EB-NeRD: weight_i = exp(-λ * (as_of_ts - clicked_at_i).total_seconds())
+        # For MIND: no timestamps → all weights = 1.0
+        weights = []
+        last_click_at = None
+        for entry in history:
+            clicked_at_str = entry.get("clicked_at")
+            if clicked_at_str is None:
+                # MIND (no timestamps) → uniform weight.
+                weights.append(1.0)
+            else:
+                clicked_at = datetime.fromisoformat(clicked_at_str)
+                delta_seconds = (as_of_ts - clicked_at).total_seconds()
+                weight = math.exp(-_DECAY_LAMBDA * max(delta_seconds, 0.0))
+                weights.append(weight)
+                if last_click_at is None or clicked_at_str > last_click_at:
+                    last_click_at = clicked_at_str
+
+        return {
+            "user_id": user_id,
+            "history": history,
+            "history_len": len(history),
+            "recency_weights": weights,
+            "last_click_at": last_click_at,
+        }
+
+    @property
+    def row_count(self) -> int:
+        return self._store.row_count()
+
+    # ── Build step ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def build_features(
+        dataset: str,
+        interim_dir: Path | None = None,
+        processed_dir: Path | None = None,
+    ) -> Path:
+        """Read interim behaviors and write user_features.parquet.
+
+        Derives per-user features:
+          - all_history: full list of {article_id, clicked_at} dicts, de-duped
+            by article_id (keeping earliest click for EB-NeRD, or first
+            occurrence for MIND).
+          - history_len: count of unique articles in history.
+          - last_active_at: max impression timestamp across all impressions.
+
+        Parameters
+        ----------
+        dataset : str
+            ``"mind"`` or ``"ebnerd"``.
+        interim_dir : Path, optional
+            Override for ``data/interim/{dataset}/``.
+        processed_dir : Path, optional
+            Override for ``data/processed/{dataset}/``.
+
+        Returns
+        -------
+        Path
+            Path to the written Parquet file.
+        """
+        if interim_dir is None:
+            interim_dir = _PROJECT_ROOT / "data" / "interim" / dataset
+        if processed_dir is None:
+            processed_dir = _PROJECT_ROOT / "data" / "processed" / dataset
+
+        beh_path = interim_dir / "behaviors.parquet"
+        if not beh_path.exists():
+            raise FileNotFoundError(
+                f"Interim behaviors not found at {beh_path}. "
+                f"Run parse_{dataset} first."
+            )
+
+        logger.info("Building user features for %s from %s", dataset, beh_path)
+        df = pl.read_parquet(beh_path)
+        logger.info("  Read %d behavior rows", len(df))
+
+        # Aggregate per-user: merge clicked_history across all impressions,
+        # de-dup by article_id (keep earliest clicked_at for EB-NeRD).
+        user_data: dict[str, dict] = {}
+        for row in df.to_dicts():
+            uid = row["user_id"]
+            ts = row["timestamp"]
+            history = json.loads(row["clicked_history"])
+
+            if uid not in user_data:
+                user_data[uid] = {
+                    "user_id": uid,
+                    "dataset": dataset,
+                    # article_id → {article_id, clicked_at} (keep earliest)
+                    "history_map": {},
+                    "last_active_at": ts,
+                }
+
+            for entry in history:
+                aid = entry["article_id"]
+                clicked_at = entry.get("clicked_at")
+                existing = user_data[uid]["history_map"].get(aid)
+                if existing is None:
+                    user_data[uid]["history_map"][aid] = entry
+                elif clicked_at is not None and existing.get("clicked_at") is not None:
+                    # Keep the earlier timestamp
+                    if clicked_at < existing["clicked_at"]:
+                        user_data[uid]["history_map"][aid] = entry
+
+            if ts and (user_data[uid]["last_active_at"] is None
+                       or ts > user_data[uid]["last_active_at"]):
+                user_data[uid]["last_active_at"] = ts
+
+        # Build the output rows
+        unified_rows = []
+        for ud in user_data.values():
+            # Sort history chronologically (by clicked_at if available)
+            history_list = list(ud["history_map"].values())
+            history_list.sort(
+                key=lambda e: e.get("clicked_at") or ""
+            )
+            unified_rows.append({
+                "user_id": ud["user_id"],
+                "dataset": ud["dataset"],
+                "all_history": json.dumps(history_list),
+                "history_len": len(history_list),
+                "last_active_at": ud["last_active_at"],
+            })
+
+        result = pl.DataFrame(unified_rows, schema={
+            "user_id": pl.Utf8,
+            "dataset": pl.Utf8,
+            "all_history": pl.Utf8,
+            "history_len": pl.Int64,
+            "last_active_at": pl.Datetime("us"),
+        })
+
+        # Write to processed dir
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        out_path = processed_dir / "user_features.parquet"
+        result.write_parquet(out_path)
+
+        logger.info(
+            "  Wrote user features: %d users → %s (%.1f MB)",
+            len(result),
+            out_path,
+            out_path.stat().st_size / 1024**2,
+        )
+        return out_path

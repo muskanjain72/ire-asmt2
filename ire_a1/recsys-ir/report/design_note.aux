@@ -1,0 +1,46 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{wu2019nrms}
+\citation{wu2020mind}
+\citation{kruse2024ebnerd}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction and Problem Framing}{1}{section.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces The Two-Stage Retrieve-then-Rank System Architecture.}}{2}{figure.caption.1}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:architecture}{{1}{2}{The Two-Stage Retrieve-then-Rank System Architecture}{figure.caption.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Feature Engineering and Behavioral Modeling}{2}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Click-History Recency Decay}{2}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Position Bias Correction}{2}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Article Freshness and Anti-Leakage Buffering}{2}{subsection.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Session and Dwell-Time Micro-Dynamics}{3}{subsection.2.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.5}Laplace-Smoothed Popularity Priors}{3}{subsection.2.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Empirical Results: Baseline Reproduction vs. Principled Improvement}{3}{section.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Official Baseline Reproduction vs. Full Two-Stage Re-Ranking Quality.}}{3}{table.caption.2}\protected@file@percent }
+\newlabel{tab:baseline_vs_improved}{{1}{3}{Official Baseline Reproduction vs. Full Two-Stage Re-Ranking Quality}{table.caption.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Systematic Ablation Study and Signal Hierarchy}{3}{section.4}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Systematic Feature Group Ablations on MIND and EB-NeRD.}}{4}{table.caption.3}\protected@file@percent }
+\newlabel{tab:ablation}{{2}{4}{Systematic Feature Group Ablations on MIND and EB-NeRD}{table.caption.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Statistical Significance and Paired Bootstrap Analysis}{4}{section.5}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Paired Bootstrap 95\% Confidence Intervals ($B = 1000$).}}{4}{table.caption.4}\protected@file@percent }
+\newlabel{tab:bootstrap_ci}{{3}{4}{Paired Bootstrap 95\% Confidence Intervals ($B = 1000$)}{table.caption.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Serving Characteristics, Latency, and Cost Modeling}{4}{section.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Index and Feature Store Memory Footprint}{4}{subsection.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Latency Profiling across Candidate Pool Sizes}{4}{subsection.6.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Latency Breakdown (ms) across Candidate Pool Sizes against SLA ($p99 < 100\text  { ms}$).}}{5}{table.caption.5}\protected@file@percent }
+\newlabel{tab:latency}{{4}{5}{Latency Breakdown (ms) across Candidate Pool Sizes against SLA ($p99 < 100\text { ms}$)}{table.caption.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Throughput and Serving Economics (AWS c6i.2xlarge)}{5}{subsection.6.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Scaling Argument: What Breaks First at 10x Scale and Remediation}{5}{section.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}The Primary Failure Point: In-Process DuckDB File Locking and Disk I/O}{5}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Production Remediation Roadmap}{5}{subsection.7.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Extended Evaluation, Slicing, and Beyond-Accuracy Dynamics}{6}{section.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Full Metric Suite with Bootstrap 95\% CIs}{6}{subsection.8.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}Slicing Analysis: Cold vs. Warm Users and Head vs. Tail Articles}{6}{subsection.8.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Performance Slicing Results with Bootstrap 95\% CIs ($B = 1000$).}}{6}{table.caption.6}\protected@file@percent }
+\newlabel{tab:slices}{{5}{6}{Performance Slicing Results with Bootstrap 95\% CIs ($B = 1000$)}{table.caption.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Anti-Gaming and Boundary Enforcement}{6}{section.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Conclusion}{6}{section.10}\protected@file@percent }
+\bibcite{kruse2024ebnerd}{1}
+\bibcite{wu2019nrms}{2}
+\bibcite{wu2020mind}{3}
+\gdef \@abspage@last{7}

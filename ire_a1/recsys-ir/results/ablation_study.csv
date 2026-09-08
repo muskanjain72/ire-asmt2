@@ -1,0 +1,15 @@
+dataset,configuration,AUC,MRR,nDCG@5,nDCG@10,delta_vs_full_AUC,delta_vs_full_MRR,delta_vs_full_nDCG@5,delta_vs_full_nDCG@10
+mind,Baseline (Stage 1),0.6302,0.3334,0.3094,0.3682,-0.0483,-0.0458,-0.0447,-0.0446
+mind,Full Model (Principled Improvement),0.6785,0.3792,0.3541,0.4128,0.0,0.0,0.0,0.0
+mind,- Category Affinity,0.6603,0.3628,0.3366,0.3966,-0.0182,-0.0164,-0.0175,-0.0162
+mind,- Position Bias,0.657,0.3571,0.3331,0.393,-0.0215,-0.0221,-0.021,-0.0198
+mind,- Freshness & Recency,0.6721,0.3737,0.348,0.407,-0.0064,-0.0055,-0.0061,-0.0058
+mind,- Session & Dwell,0.6696,0.3714,0.3459,0.4053,-0.0089,-0.0078,-0.0082,-0.0075
+mind,- Popularity Prior,0.6642,0.3657,0.3412,0.3997,-0.0143,-0.0135,-0.0129,-0.0131
+ebnerd,Baseline (Stage 1),0.5113,0.3418,0.3717,0.4566,-0.0729,-0.0567,-0.0564,-0.0558
+ebnerd,Full Model (Principled Improvement),0.5842,0.3985,0.4281,0.5124,0.0,0.0,0.0,0.0
+ebnerd,- Category Affinity,0.5601,0.38,0.4089,0.4936,-0.0241,-0.0185,-0.0192,-0.0188
+ebnerd,- Position Bias,0.5558,0.374,0.4043,0.4893,-0.0284,-0.0245,-0.0238,-0.0231
+ebnerd,- Freshness & Recency,0.569,0.3864,0.4153,0.5005,-0.0152,-0.0121,-0.0128,-0.0119
+ebnerd,- Session & Dwell,0.5724,0.3891,0.4182,0.5032,-0.0118,-0.0094,-0.0099,-0.0092
+ebnerd,- Popularity Prior,0.5677,0.3843,0.4142,0.4979,-0.0165,-0.0142,-0.0139,-0.0145
