@@ -38,14 +38,52 @@ from src.reranking.train_reranker import GBDTReranker, build_training_dataset
 logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# Feature groups for ablation study mapped to semantic feature names
+ABLATION_FEATURE_GROUPS: dict[str, list[str]] = {
+    "Full Model": [],
+    "- Category Affinity": [
+        "article_category_affinity",
+        "article_subcategory_affinity",
+        "article_is_top_category_match",
+        "article_is_top_subcategory_match",
+    ],
+    "- Position Bias": [
+        "position_bias_rank",
+        "position_bias_relative",
+        "position_bias_reciprocal",
+        "position_bias_log_discount",
+        "position_bias_empirical_ctr",
+    ],
+    "- Freshness & Recency": [
+        "user_mean_recency_weight",
+        "article_freshness_hours",
+        "article_freshness_available",
+    ],
+    "- Session & Dwell": [
+        "session_impression_index",
+        "session_clicks_so_far_log",
+        "session_dwell_time_log",
+        "session_mean_scroll",
+        "session_time_since_start_hours",
+        "session_time_since_last_min",
+        "session_dwell_available",
+    ],
+    "- Popularity Prior": [
+        "article_train_pop_clicks_log",
+        "article_train_pop_inviews_log",
+        "article_train_empirical_ctr",
+    ],
+    "- History Embeddings & Semantic Overlap": [
+        "user_history_embedding_similarity",
+        "user_history_max_embedding_sim",
+        "user_history_title_overlap",
+    ],
+}
+
 # Feature indices for ablation masks
 ABLATION_MASKS: dict[str, list[int]] = {
-    "Full Model": [],
-    "- Category Affinity": [24, 25, 26, 27],
-    "- Position Bias": [14, 15, 16, 17, 18],
-    "- Freshness & Recency": [6, 22, 23],
-    "- Session & Dwell": [7, 8, 9, 10, 11, 12, 13],
-    "- Popularity Prior": [19, 20, 21],
+    group: [FEATURE_NAMES.index(fn) for fn in fnames if fn in FEATURE_NAMES]
+    for group, fnames in ABLATION_FEATURE_GROUPS.items()
 }
 
 

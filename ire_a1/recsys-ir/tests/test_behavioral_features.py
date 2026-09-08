@@ -310,3 +310,115 @@ def test_behavioral_feature_extractor_category_affinity_and_freshness():
     assert f_news.category_affinity == 0.0  # never read politics
     assert f_news.is_top_category_match is False
     assert math.isclose(f_news.freshness_hours, 2.0)  # 10:00 to 12:00 = 2h
+
+
+def test_user_click_history_titles_categories_and_embeddings():
+    """Verify Q1 mandate: recent clicked articles (titles, categories, embeddings) and candidate interactions."""
+    import numpy as np
+
+    # Setup articles with titles and categories
+    mock_articles = {
+        "A1": {"article_id": "A1", "title": "Manchester United wins derby", "category": "sports", "subcategory": "football"},
+        "A2": {"article_id": "A2", "title": "Arsenal transfers update", "category": "sports", "subcategory": "football"},
+        "CAND_1": {"article_id": "CAND_1", "title": "Manchester derby analysis", "category": "sports", "subcategory": "football"},
+        "CAND_2": {"article_id": "CAND_2", "title": "Stock market rallies today", "category": "finance", "subcategory": "markets"},
+    }
+    store = MockArticleStore(mock_articles)
+
+    # 4-dimensional normalized embeddings
+    embeddings = {
+        "A1": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        "A2": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        "CAND_1": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),  # identical to A1
+        "CAND_2": np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32),  # orthogonal
+    }
+
+    extractor = BehavioralFeatureExtractor(
+        dataset="ebnerd",
+        article_store=store,
+        article_index=embeddings,
+    )
+
+    as_of = datetime(2023, 5, 20, 12, 0, 0)
+    raw_history = [
+        {"article_id": "A1", "clicked_at": "2023-05-19T10:00:00"},
+        {"article_id": "A2", "clicked_at": "2023-05-20T10:00:00"},
+    ]
+
+    summary = extractor.summarize_user_history("U1", as_of, raw_history=raw_history, decay_mode="unified")
+
+    # 1. Verify UserClickHistorySummary fields
+    assert summary.recent_article_ids == ["A1", "A2"]
+    assert summary.recent_titles == ["Manchester United wins derby", "Arsenal transfers update"]
+    assert summary.recent_categories == ["sports", "sports"]
+    assert summary.recent_embeddings is not None
+    assert summary.recent_embeddings.shape == (2, 4)
+    np.testing.assert_allclose(summary.recent_embeddings[0], embeddings["A1"])
+    np.testing.assert_allclose(summary.recent_embeddings[1], embeddings["A2"])
+
+    # User profile embedding must be unit length and recency-weighted
+    assert summary.user_embedding is not None
+    assert summary.user_embedding.shape == (4,)
+    assert math.isclose(np.linalg.norm(summary.user_embedding), 1.0, rel_tol=1e-5)
+    # A2 is more recent than A1, so A2 component > A1 component
+    assert summary.user_embedding[1] > summary.user_embedding[0]
+
+    # Verify to_dict serialization
+    d = summary.to_dict()
+    assert d["has_recent_embeddings"] is True
+    assert d["has_user_embedding"] is True
+    assert d["recent_titles"] == summary.recent_titles
+    assert d["recent_categories"] == summary.recent_categories
+
+    # 2. Verify Candidate interaction features
+    cand_feats = extractor.extract_candidate_features(["CAND_1", "CAND_2"], summary, as_of)
+    assert len(cand_feats) == 2
+
+    # CAND_1: sports, shared words ("Manchester", "derby"), identical vector to A1
+    f1 = cand_feats[0]
+    assert f1.article_id == "CAND_1"
+    assert f1.user_history_title_overlap > 0.0  # shares words with A1
+    assert f1.user_history_embedding_similarity > 0.0  # positive dot product with user vector
+    assert math.isclose(f1.user_history_max_embedding_sim, 1.0, rel_tol=1e-5)  # exact match with A1
+
+    # CAND_2: finance, orthogonal embedding, no shared title words
+    f2 = cand_feats[1]
+    assert f2.article_id == "CAND_2"
+    assert f2.user_history_title_overlap == 0.0
+    assert math.isclose(f2.user_history_embedding_similarity, 0.0, abs_tol=1e-5)
+    assert math.isclose(f2.user_history_max_embedding_sim, 0.0, abs_tol=1e-5)
+
+
+def test_behavioral_window_anti_leakage_for_embeddings_and_titles():
+    """Verify that clicks at or after as_of_ts never leak into titles, categories, or embeddings."""
+    import numpy as np
+
+    mock_articles = {
+        "PAST": {"article_id": "PAST", "title": "Past Article", "category": "news"},
+        "FUTURE": {"article_id": "FUTURE", "title": "Secret Future Leak", "category": "secret"},
+    }
+    store = MockArticleStore(mock_articles)
+    embeddings = {
+        "PAST": np.array([1.0, 0.0], dtype=np.float32),
+        "FUTURE": np.array([0.0, 1.0], dtype=np.float32),
+    }
+
+    extractor = BehavioralFeatureExtractor(dataset="ebnerd", article_store=store, article_index=embeddings)
+    as_of = datetime(2023, 5, 20, 12, 0, 0)
+
+    raw_history = [
+        {"article_id": "PAST", "clicked_at": "2023-05-20T11:59:59"},   # Before cutoff
+        {"article_id": "FUTURE", "clicked_at": "2023-05-20T12:00:00"}, # Exactly at cutoff -> excluded
+        {"article_id": "FUTURE", "clicked_at": "2023-05-20T12:05:00"}, # After cutoff -> excluded
+    ]
+
+    summary = extractor.summarize_user_history("U1", as_of, raw_history=raw_history)
+    assert summary.active_history_len == 1
+    assert summary.recent_article_ids == ["PAST"]
+    assert summary.recent_titles == ["Past Article"]
+    assert "Secret Future Leak" not in summary.recent_titles
+    assert summary.recent_categories == ["news"]
+    assert "secret" not in summary.category_distribution
+    assert summary.recent_embeddings.shape == (1, 2)
+    np.testing.assert_allclose(summary.recent_embeddings[0], [1.0, 0.0])
+

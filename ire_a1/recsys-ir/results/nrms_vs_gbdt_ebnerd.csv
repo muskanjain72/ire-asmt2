@@ -1,0 +1,5 @@
+dataset,metric,before_nrms,after_gbdt,absolute_gain,relative_gain_pct
+ebnerd,AUC,0.5506,0.5565,0.0059,1.07
+ebnerd,MRR,0.3448,0.3339,-0.0109,-3.15
+ebnerd,nDCG@5,0.3818,0.3697,-0.0122,-3.18
+ebnerd,nDCG@10,0.4623,0.4598,-0.0024,-0.53

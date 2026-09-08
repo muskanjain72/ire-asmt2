@@ -1,0 +1,5 @@
+dataset,metric,mean_before_nrms,mean_after_gbdt,absolute_diff,relative_gain_pct,ci_low_95,ci_high_95,p_value,excludes_zero,statistically_significant
+ebnerd,AUC,0.5506,0.5565,0.0059,1.07,-0.0298,0.0421,0.742,false,false
+ebnerd,MRR,0.3448,0.3339,-0.0109,-3.15,-0.0443,0.0219,0.554,false,false
+ebnerd,nDCG@5,0.3818,0.3697,-0.0122,-3.18,-0.0484,0.0238,0.576,false,false
+ebnerd,nDCG@10,0.4623,0.4598,-0.0024,-0.53,-0.0302,0.0272,0.918,false,false

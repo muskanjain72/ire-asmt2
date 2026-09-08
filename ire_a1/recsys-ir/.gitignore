@@ -48,3 +48,6 @@ logs/*.log
 
 # Model artifacts (reproducible from scripts; not source code)
 *.joblib
+models/**
+!models/**/.gitkeep
+*.h5

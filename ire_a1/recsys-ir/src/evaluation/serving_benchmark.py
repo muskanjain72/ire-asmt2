@@ -359,7 +359,8 @@ def run_serving_benchmarks(
     )
 
     reranker = GBDTReranker(model_type="lightgbm", n_estimators=40, max_depth=5)
-    X_dummy = np.random.randn(500, 28).astype(np.float32)
+    n_feats = len(pipeline_feat.feature_names)
+    X_dummy = np.random.randn(500, n_feats).astype(np.float32)
     y_dummy = (np.random.rand(500) > 0.8).astype(int)
     groups_dummy = [10] * 50
     reranker.fit(X_dummy, y_dummy, groups_dummy)

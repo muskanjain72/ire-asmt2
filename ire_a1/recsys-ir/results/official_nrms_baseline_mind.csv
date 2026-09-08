@@ -1,0 +1,2 @@
+dataset,model,AUC,MRR,nDCG@5,nDCG@10,n_evaluated,trained_epochs,train_samples
+mind,Official_NRMS_Baseline,0.5461,0.2474,0.2593,0.3233,500,3,2000

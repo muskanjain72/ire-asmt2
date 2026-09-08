@@ -39,10 +39,13 @@ FEATURE_NAMES: list[str] = [
     "retrieval_embed_sim",
     "retrieval_hybrid_score",
     "retrieval_rank_pct",
-    # 2. Q1 Click-History features (3)
+    # 2. Q1 Click-History features (6)
     "user_lifetime_history_log",
     "user_active_history_log",
     "user_mean_recency_weight",
+    "user_history_embedding_similarity",
+    "user_history_max_embedding_sim",
+    "user_history_title_overlap",
     # 3. Q1 Session features (7)
     "session_impression_index",
     "session_clicks_so_far_log",
@@ -79,12 +82,13 @@ class ReRankFeaturePipeline:
         article_store: ArticleFeatureStore,
         session_extractor: SessionFeatureExtractor | None = None,
         behavioral_extractor: BehavioralFeatureExtractor | None = None,
+        article_index: Any | None = None,
     ) -> None:
         self.dataset = dataset.lower()
         self.article_store = article_store
         self.session_extractor = session_extractor or SessionFeatureExtractor(dataset=self.dataset)
         self.behavioral_extractor = behavioral_extractor or BehavioralFeatureExtractor(
-            dataset=self.dataset, article_store=article_store
+            dataset=self.dataset, article_store=article_store, article_index=article_index
         )
         self.feature_names = list(FEATURE_NAMES)
 
@@ -196,8 +200,18 @@ class ReRankFeaturePipeline:
             p_log = float(p_feat.log_position_discount)
             p_ctr = float(p_feat.empirical_position_ctr)
 
-            # Candidate article features
+            # Candidate article & interaction features
             c_feat = cand_behavioral[i]
+
+            # Click-history embedding and title overlap signals
+            hist_emb_sim = float(c_feat.user_history_embedding_similarity)
+            if hist_emb_sim == 0.0 and cid in embed_map:
+                hist_emb_sim = float(embed_map[cid])
+            hist_max_sim = float(c_feat.user_history_max_embedding_sim)
+            if hist_max_sim == 0.0 and hist_emb_sim != 0.0:
+                hist_max_sim = hist_emb_sim
+            hist_title_ov = float(c_feat.user_history_title_overlap)
+
             art_clicks_log = float(c_feat.train_popularity_log_clicks)
             art_inviews_log = float(c_feat.train_popularity_log_inviews)
             art_ctr = float(c_feat.train_empirical_ctr)
@@ -210,7 +224,7 @@ class ReRankFeaturePipeline:
 
             rows.append([
                 b_val, e_val, h_val, r_rank_pct,
-                u_life_log, u_act_log, u_mean_w,
+                u_life_log, u_act_log, u_mean_w, hist_emb_sim, hist_max_sim, hist_title_ov,
                 s_imp_idx, s_clicks_log, s_dwell_log, s_scroll, s_time_start_h, s_time_last_m, s_dwell_avail,
                 p_rank, p_rel, p_recip, p_log, p_ctr,
                 art_clicks_log, art_inviews_log, art_ctr, art_fresh_h, art_fresh_avail,

@@ -26,7 +26,7 @@ Implements Assignment 2 Q1 requirements:
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 import math
@@ -140,6 +140,10 @@ class UserClickHistorySummary:
     top_subcategory: str | None
     recency_weights: list[float]
     decay_mode_used: str
+    recent_titles: list[str] = field(default_factory=list)
+    recent_categories: list[str] = field(default_factory=list)
+    recent_embeddings: np.ndarray | None = None
+    user_embedding: np.ndarray | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -153,6 +157,10 @@ class UserClickHistorySummary:
             "top_subcategory": self.top_subcategory,
             "recency_weights": self.recency_weights,
             "decay_mode_used": self.decay_mode_used,
+            "recent_titles": self.recent_titles,
+            "recent_categories": self.recent_categories,
+            "has_recent_embeddings": self.recent_embeddings is not None and len(self.recent_embeddings) > 0,
+            "has_user_embedding": self.user_embedding is not None,
         }
 
 
@@ -169,6 +177,9 @@ class CandidateBehavioralFeatures:
     train_empirical_ctr: float
     freshness_hours: float | None
     freshness_available: bool
+    user_history_embedding_similarity: float = 0.0
+    user_history_max_embedding_sim: float = 0.0
+    user_history_title_overlap: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -182,6 +193,9 @@ class CandidateBehavioralFeatures:
             "train_empirical_ctr": self.train_empirical_ctr,
             "freshness_hours": self.freshness_hours if self.freshness_hours is not None else -1.0,
             "freshness_available": float(self.freshness_available),
+            "user_history_embedding_similarity": self.user_history_embedding_similarity,
+            "user_history_max_embedding_sim": self.user_history_max_embedding_sim,
+            "user_history_title_overlap": self.user_history_title_overlap,
         }
 
 
@@ -196,6 +210,7 @@ class BehavioralFeatureExtractor:
         train_popularity: dict[str, int] | None = None,
         train_inviews: dict[str, int] | None = None,
         history_cap: int = 20,
+        article_index: Any | None = None,
     ) -> None:
         self.dataset = dataset.lower()
         self.article_store = article_store
@@ -203,6 +218,57 @@ class BehavioralFeatureExtractor:
         self.train_popularity = train_popularity or {}
         self.train_inviews = train_inviews or {}
         self.history_cap = history_cap
+        self.article_index = article_index
+
+    def _get_embedding(self, article_id: str) -> np.ndarray | None:
+        """Retrieve embedding vector for an article ID from index, dict, or store."""
+        if self.article_index is None:
+            return None
+        aid = str(article_id)
+        if hasattr(self.article_index, "get_embedding"):
+            emb = self.article_index.get_embedding(aid)
+            if emb is not None:
+                return np.asarray(emb, dtype=np.float32)
+        elif isinstance(self.article_index, dict):
+            if aid in self.article_index:
+                return np.asarray(self.article_index[aid], dtype=np.float32)
+        elif callable(self.article_index):
+            emb = self.article_index(aid)
+            if emb is not None:
+                return np.asarray(emb, dtype=np.float32)
+        return None
+
+    def _get_embeddings_batch(
+        self, article_ids: list[str]
+    ) -> tuple[dict[str, np.ndarray], int | None]:
+        """Retrieve embedding vectors for a batch of article IDs."""
+        if self.article_index is None or not article_ids:
+            return {}, None
+        str_ids = [str(x) for x in article_ids]
+        if hasattr(self.article_index, "get_embeddings_batch"):
+            mat, found_ids = self.article_index.get_embeddings_batch(str_ids)
+            if len(found_ids) > 0 and mat.shape[0] > 0:
+                dim = mat.shape[1]
+                return {aid: mat[i].astype(np.float32) for i, aid in enumerate(found_ids)}, dim
+            return {}, None
+        elif isinstance(self.article_index, dict):
+            found = {
+                aid: np.asarray(self.article_index[aid], dtype=np.float32)
+                for aid in str_ids
+                if aid in self.article_index
+            }
+            dim = next(iter(found.values())).shape[0] if found else None
+            return found, dim
+        else:
+            found = {}
+            dim = None
+            for aid in str_ids:
+                emb = self._get_embedding(aid)
+                if emb is not None:
+                    found[aid] = emb
+                    if dim is None:
+                        dim = emb.shape[0]
+            return found, dim
 
     def summarize_user_history(
         self,
@@ -257,27 +323,28 @@ class BehavioralFeatureExtractor:
             normalize=True,
         )
 
-        # 3. Aggregate categories and subcategories
+        # 3. Aggregate categories, subcategories, titles, and embeddings
         recent_ids = [str(entry["article_id"]) for entry in recent]
-        article_rows = self.article_store.get_articles_batch(
-            recent_ids,
-            columns=["article_id", "category", "subcategory"],
-        )
-        art_map = {row["article_id"]: row for row in article_rows}
+        article_rows = self.article_store.get_articles_batch(recent_ids)
+        art_map = {str(row["article_id"]): row for row in article_rows}
 
+        recent_titles: list[str] = []
+        recent_categories: list[str] = []
         cat_weights: Counter[str] = Counter()
         subcat_weights: Counter[str] = Counter()
 
         for idx, aid in enumerate(recent_ids):
             w = weights[idx] if idx < len(weights) else 1.0
-            art = art_map.get(aid)
-            if art:
-                cat = art.get("category")
-                if cat:
-                    cat_weights[str(cat)] += w
-                subcat = art.get("subcategory")
-                if subcat:
-                    subcat_weights[str(subcat)] += w
+            art = art_map.get(aid, {})
+            title = str(art.get("title") or art.get("cleaned_text") or "")
+            recent_titles.append(title)
+            cat = str(art.get("category") or "")
+            recent_categories.append(cat)
+            if cat:
+                cat_weights[cat] += w
+            subcat = art.get("subcategory")
+            if subcat:
+                subcat_weights[str(subcat)] += w
 
         total_cat_w = sum(cat_weights.values())
         cat_dist = (
@@ -295,6 +362,35 @@ class BehavioralFeatureExtractor:
         )
         top_subcat = subcat_weights.most_common(1)[0][0] if subcat_weights else None
 
+        # 4. Extract recent embeddings and recency-weighted pooled user profile embedding
+        emb_map, dim = self._get_embeddings_batch(recent_ids)
+        recent_embeddings_list: list[np.ndarray] = []
+        user_vector = np.zeros(dim, dtype=np.float32) if dim else None
+        valid_emb_count = 0
+
+        for idx, aid in enumerate(recent_ids):
+            w = weights[idx] if idx < len(weights) else 1.0
+            if aid in emb_map:
+                emb = emb_map[aid]
+                recent_embeddings_list.append(emb)
+                if user_vector is not None:
+                    user_vector += w * emb
+                    valid_emb_count += 1
+
+        if valid_emb_count > 0 and user_vector is not None:
+            norm = np.linalg.norm(user_vector)
+            if norm > 0:
+                user_vector = user_vector / norm
+            user_embedding = user_vector.astype(np.float32)
+        else:
+            user_embedding = None
+
+        recent_embeddings = (
+            np.array(recent_embeddings_list, dtype=np.float32)
+            if recent_embeddings_list
+            else None
+        )
+
         return UserClickHistorySummary(
             user_id=user_id,
             lifetime_history_len=lifetime_len,
@@ -306,6 +402,10 @@ class BehavioralFeatureExtractor:
             top_subcategory=top_subcat,
             recency_weights=weights,
             decay_mode_used=decay_mode,
+            recent_titles=recent_titles,
+            recent_categories=recent_categories,
+            recent_embeddings=recent_embeddings,
+            user_embedding=user_embedding,
         )
 
     def extract_candidate_features(
@@ -321,6 +421,8 @@ class BehavioralFeatureExtractor:
         - Match indicators with user's top historical preferences
         - Train-split-only popularity and CTR signals
         - Article freshness in hours (EB-NeRD), with leakage verification
+        - User click-history embedding cosine similarity and max item similarity
+        - Title lexical overlap (Jaccard) with user's recent clicked titles
 
         Parameters
         ----------
@@ -336,11 +438,8 @@ class BehavioralFeatureExtractor:
         list[CandidateBehavioralFeatures]
         """
         cands = [str(cid) for cid in candidate_ids]
-        meta_rows = self.article_store.get_articles_batch(
-            cands,
-            columns=["article_id", "category", "subcategory", "published_at"],
-        )
-        meta_map = {row["article_id"]: row for row in meta_rows}
+        meta_rows = self.article_store.get_articles_batch(cands)
+        meta_map = {str(row["article_id"]): row for row in meta_rows}
 
         results = []
         for cid in cands:
@@ -381,6 +480,39 @@ class BehavioralFeatureExtractor:
                 freshness_hours = None
                 freshness_avail = False
 
+            # Title word overlap (Jaccard similarity) with user's recent clicked titles
+            cand_title = str(meta.get("title") or meta.get("cleaned_text") or "")
+            title_overlap = 0.0
+            if cand_title and user_summary.recent_titles:
+                cand_words = set(cand_title.lower().split())
+                hist_words = set()
+                for ht in user_summary.recent_titles:
+                    if ht:
+                        hist_words.update(ht.lower().split())
+                if cand_words and hist_words:
+                    intersection = cand_words & hist_words
+                    union = cand_words | hist_words
+                    title_overlap = float(len(intersection) / len(union)) if union else 0.0
+
+            # History embedding similarities
+            emb_sim = 0.0
+            max_emb_sim = 0.0
+            cand_emb = self._get_embedding(cid)
+            if cand_emb is not None:
+                cand_norm = np.linalg.norm(cand_emb)
+                c_unit = cand_emb / cand_norm if cand_norm > 0 else None
+                if c_unit is not None:
+                    if user_summary.user_embedding is not None:
+                        emb_sim = float(np.dot(user_summary.user_embedding, c_unit))
+                        emb_sim = max(-1.0, min(1.0, emb_sim))
+                    if user_summary.recent_embeddings is not None and len(user_summary.recent_embeddings) > 0:
+                        rec_norms = np.linalg.norm(user_summary.recent_embeddings, axis=1, keepdims=True)
+                        rec_norms = np.where(rec_norms == 0, 1.0, rec_norms)
+                        normed_rec = user_summary.recent_embeddings / rec_norms
+                        sims = np.dot(normed_rec, c_unit)
+                        max_emb_sim = float(np.max(sims))
+                        max_emb_sim = max(-1.0, min(1.0, max_emb_sim))
+
             results.append(
                 CandidateBehavioralFeatures(
                     article_id=cid,
@@ -393,6 +525,9 @@ class BehavioralFeatureExtractor:
                     train_empirical_ctr=ctr,
                     freshness_hours=freshness_hours,
                     freshness_available=freshness_avail,
+                    user_history_embedding_similarity=emb_sim,
+                    user_history_max_embedding_sim=max_emb_sim,
+                    user_history_title_overlap=title_overlap,
                 )
             )
 

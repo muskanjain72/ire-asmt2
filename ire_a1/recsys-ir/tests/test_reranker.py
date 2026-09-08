@@ -62,6 +62,13 @@ def test_rerank_feature_pipeline_shape_and_columns(mock_pipeline):
     assert not np.isnan(X).any()
     assert not np.isinf(X).any()
 
+    # Check that Q1 history embedding similarity was populated
+    idx_sim = FEATURE_NAMES.index("user_history_embedding_similarity")
+    idx_max_sim = FEATURE_NAMES.index("user_history_max_embedding_sim")
+    assert math.isclose(X[0, idx_sim], 0.8, rel_tol=1e-4)
+    assert math.isclose(X[0, idx_max_sim], 0.8, rel_tol=1e-4)
+    assert math.isclose(X[2, idx_sim], 0.6, rel_tol=1e-4)
+
 
 def test_gbdt_reranker_fit_and_predict():
     """Verify GBDTReranker trains and outputs probability scores."""
