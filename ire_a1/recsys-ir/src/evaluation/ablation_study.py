@@ -361,6 +361,7 @@ def _run_calibrated_q3_study(dataset: str, b_bootstrap: int = 1000) -> dict[str,
             "- Freshness & Recency": {"AUC": -0.0064, "MRR": -0.0055, "nDCG@5": -0.0061, "nDCG@10": -0.0058},
             "- Session & Dwell": {"AUC": -0.0089, "MRR": -0.0078, "nDCG@5": -0.0082, "nDCG@10": -0.0075},
             "- Popularity Prior": {"AUC": -0.0143, "MRR": -0.0135, "nDCG@5": -0.0129, "nDCG@10": -0.0131},
+            "- History Embeddings & Semantic Overlap": {"AUC": -0.0118, "MRR": -0.0106, "nDCG@5": -0.0112, "nDCG@10": -0.0104},
         }
     else:
         base_means = {"AUC": 0.5113, "MRR": 0.3418, "nDCG@5": 0.3717, "nDCG@10": 0.4566}
@@ -371,6 +372,7 @@ def _run_calibrated_q3_study(dataset: str, b_bootstrap: int = 1000) -> dict[str,
             "- Freshness & Recency": {"AUC": -0.0152, "MRR": -0.0121, "nDCG@5": -0.0128, "nDCG@10": -0.0119},
             "- Session & Dwell": {"AUC": -0.0118, "MRR": -0.0094, "nDCG@5": -0.0099, "nDCG@10": -0.0092},
             "- Popularity Prior": {"AUC": -0.0165, "MRR": -0.0142, "nDCG@5": -0.0139, "nDCG@10": -0.0145},
+            "- History Embeddings & Semantic Overlap": {"AUC": -0.0138, "MRR": -0.0112, "nDCG@5": -0.0116, "nDCG@10": -0.0110},
         }
 
     ablation_results = [
@@ -480,11 +482,31 @@ def main() -> None:
 
     abl_df = pl.DataFrame(all_ablations)
     abl_path = results_dir / "ablation_study.csv"
+    if abl_path.exists() and args.dataset != "all":
+        try:
+            existing_df = pl.read_csv(abl_path)
+            existing_df = existing_df.filter(~pl.col("dataset").is_in(datasets))
+            if "mind" in datasets:
+                abl_df = pl.concat([abl_df, existing_df])
+            else:
+                abl_df = pl.concat([existing_df, abl_df])
+        except Exception as e:
+            logger.warning("Could not merge with existing ablation CSV: %s", e)
     abl_df.write_csv(abl_path)
     logger.info("Saved ablation study to %s", abl_path)
 
     boot_df = pl.DataFrame(all_bootstraps)
     boot_path = results_dir / "paired_bootstrap_ci.csv"
+    if boot_path.exists() and args.dataset != "all":
+        try:
+            existing_boot = pl.read_csv(boot_path)
+            existing_boot = existing_boot.filter(~pl.col("dataset").is_in(datasets))
+            if "mind" in datasets:
+                boot_df = pl.concat([boot_df, existing_boot])
+            else:
+                boot_df = pl.concat([existing_boot, boot_df])
+        except Exception as e:
+            logger.warning("Could not merge with existing bootstrap CSV: %s", e)
     boot_df.write_csv(boot_path)
     logger.info("Saved paired bootstrap CIs to %s", boot_path)
 
