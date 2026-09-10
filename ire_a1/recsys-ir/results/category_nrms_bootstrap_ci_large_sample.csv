@@ -1,0 +1,5 @@
+dataset,sample_size,comparison,metric,mean_baseline,mean_improved,absolute_diff,ci_low_95,ci_high_95,ci_width,std_diff,p_value,excludes_zero,statistically_significant
+ebnerd,2500,Gate vs Official Baseline (Large Sample),AUC,0.5508,0.572,0.0211,0.0141,0.0282,0.0141,0.1812,0.001,true,true
+ebnerd,2500,Gate vs Official Baseline (Large Sample),MRR,0.3311,0.3503,0.0192,0.0116,0.0274,0.0158,0.1995,0.001,true,true
+ebnerd,2500,Gate vs Official Baseline (Large Sample),nDCG@5,0.3744,0.3942,0.0198,0.0115,0.0277,0.0162,0.2059,0.001,true,true
+ebnerd,2500,Gate vs Official Baseline (Large Sample),nDCG@10,0.4537,0.4716,0.0179,0.0114,0.0244,0.013,0.1657,0.001,true,true

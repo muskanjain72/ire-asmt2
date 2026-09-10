@@ -1,0 +1,2 @@
+model,AUC,MRR,nDCG@5,nDCG@10,real_gate_auc,delta_vs_real_gate,ablation_auc,official_baseline_auc
+CategoryAwareNRMS_ShuffledCategory,0.5798,0.3619,0.396,0.4815,0.5966,-0.0168,0.579,0.5807

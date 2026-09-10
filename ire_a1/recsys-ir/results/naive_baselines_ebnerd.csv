@@ -1,0 +1,5 @@
+sample_size,model,AUC,MRR
+500,Popularity-Only,0.4575,0.2706
+500,Recency-Only,0.5164,0.3073
+2500,Popularity-Only,0.4482,0.2657
+2500,Recency-Only,0.5028,0.3153

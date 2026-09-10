@@ -1,0 +1,2 @@
+sample_size,seed_42_baseline_auc,seed_123_baseline_auc,seed_variance_delta_auc,seed_123_throughput_impr_per_sec,seed_123_latency_ms_per_impr,real_gate_auc,shuffled_gate_auc,shuffled_vs_real_delta_auc,shuffled_throughput_impr_per_sec,shuffled_latency_ms_per_impr
+2500,0.5508,0.5503,0.0005,10.23,97.79,0.572,0.55,-0.022,19.39,51.56
