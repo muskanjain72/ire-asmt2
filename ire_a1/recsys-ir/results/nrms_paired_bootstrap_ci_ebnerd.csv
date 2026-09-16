@@ -1,8 +1,8 @@
 dataset,comparison,metric,mean_before_nrms,mean_after_gbdt,mean_baseline,mean_improved,absolute_diff,relative_gain_pct,ci_low_95,ci_high_95,p_value,excludes_zero,direction,statistically_significant
-ebnerd,Full Model vs Full-Scale NRMS,AUC,0.5807,0.5703,0.5807,0.5703,-0.0104,-1.79,-0.0495,0.0277,0.604,false,neutral / inconclusive,false
-ebnerd,Full Model vs Full-Scale NRMS,MRR,0.3677,0.3435,0.3677,0.3435,-0.0243,-6.6,-0.0617,0.011,0.18,false,neutral / inconclusive,false
-ebnerd,Full Model vs Full-Scale NRMS,nDCG@5,0.4007,0.3905,0.4007,0.3905,-0.0103,-2.56,-0.0501,0.0289,0.63,false,neutral / inconclusive,false
-ebnerd,Full Model vs Full-Scale NRMS,nDCG@10,0.4826,0.4662,0.4826,0.4662,-0.0164,-3.41,-0.0492,0.0133,0.294,false,neutral / inconclusive,false
+ebnerd,Full Model vs Full-Scale NRMS,AUC,0.5807,0.6227,0.5807,0.6227,0.042,7.24,0.0033,0.0798,0.028,true,improvement,true
+ebnerd,Full Model vs Full-Scale NRMS,MRR,0.3677,0.3892,0.3677,0.3892,0.0215,5.84,-0.0196,0.0591,0.266,false,neutral / inconclusive,false
+ebnerd,Full Model vs Full-Scale NRMS,nDCG@5,0.4007,0.4443,0.4007,0.4443,0.0435,10.87,-0.0,0.0859,0.052,false,neutral / inconclusive,false
+ebnerd,Full Model vs Full-Scale NRMS,nDCG@10,0.4826,0.5093,0.4826,0.5093,0.0267,5.53,-0.0079,0.0602,0.148,false,neutral / inconclusive,false
 ebnerd,Full Model vs Stage-1 Starter Baseline,AUC,0.5161,0.5892,0.5161,0.5892,0.0731,14.17,0.0702,0.076,0.001,true,improvement,true
 ebnerd,Full Model vs Stage-1 Starter Baseline,MRR,0.3468,0.4062,0.3468,0.4062,0.0595,17.15,0.0573,0.0618,0.001,true,improvement,true
 ebnerd,Full Model vs Stage-1 Starter Baseline,nDCG@5,0.3752,0.4313,0.3752,0.4313,0.0561,14.95,0.054,0.0583,0.001,true,improvement,true

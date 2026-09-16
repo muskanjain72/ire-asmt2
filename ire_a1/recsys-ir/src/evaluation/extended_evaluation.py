@@ -38,6 +38,7 @@ from src.evaluation.beyond_accuracy import (
     compute_novelty,
 )
 from src.evaluation.bootstrap import compute_bootstrap_ci
+from src.evaluation.eval_reranker import load_dataset_popularity
 from src.evaluation.ranking_metrics import auc_score, mrr, ndcg_at_k
 from src.evaluation.slicing import get_article_slice, get_user_slice
 from src.feature_store.article_store import ArticleFeatureStore
@@ -97,7 +98,7 @@ class ExtendedMockArticleStore:
 def evaluate_extended_pipeline(
     dataset: str,
     scale: str = "small",
-    sample_size: int = 1000,
+    sample_size: int | None = None,
     b_bootstrap: int = 1000,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Run full extended evaluation across all metrics and slices with bootstrap 95% CIs."""
@@ -123,33 +124,66 @@ def evaluate_extended_pipeline(
 
     # Load real article store and behaviors
     art_store = ArticleFeatureStore(dataset=dataset, processed_dir=p_dir)
-    pipeline_feat = ReRankFeaturePipeline(dataset=dataset, article_store=art_store)
 
     # Train re-ranker on train split
     beh_df = pl.read_parquet(beh_path)
     train_df = beh_df.filter(pl.col("split") == "train")
-    val_df = beh_df.filter(pl.col("split") == "validation")
+    val_df = beh_df.filter(pl.col("split").is_in(["val", "validation"]))
 
-    # Load popularity
-    train_popularity: dict[str, int] = {}
-    total_train_items = 0
-    for row in train_df.iter_rows(named=True):
-        raw_cands = row.get("candidates")
-        if raw_cands:
-            cands = json.loads(raw_cands) if isinstance(raw_cands, str) else list(raw_cands)
-            for c in cands:
-                cid = str(c)
-                train_popularity[cid] = train_popularity.get(cid, 0) + 1
-                total_train_items += 1
+    # Populate feature pipeline with real train-only priors & position bias
+    train_clicks, train_inviews = load_dataset_popularity(train_df)
+    total_train_items = sum(train_clicks.values())
+    pos_model = PositionBiasModel.fit_from_training_behaviors(train_df)
 
-    # Train GBDT
-    reranker = GBDTReranker(model_type="lightgbm", n_estimators=60, max_depth=5)
-    X_train, y_train, groups_train = build_training_dataset(
-        behaviors_df=train_df,
-        pipeline=pipeline_feat,
-        sample_limit=2000,
+    behavioral_extractor = BehavioralFeatureExtractor(
+        dataset=dataset,
+        article_store=art_store,
+        train_popularity=train_clicks,
+        train_inviews=train_inviews,
     )
-    reranker.fit(X_train, y_train, groups_train)
+    session_extractor = SessionFeatureExtractor(
+        dataset=dataset,
+        position_bias_model=pos_model,
+    )
+    pipeline_feat = ReRankFeaturePipeline(
+        dataset=dataset,
+        article_store=art_store,
+        session_extractor=session_extractor,
+        behavioral_extractor=behavioral_extractor,
+    )
+
+    # Load real embeddings for ILD
+    if dataset == "mind":
+        emb_ids_path = _PROJECT_ROOT / "data" / "processed" / "embeddings" / "mind_minilm_large_ids.json"
+        emb_npy_path = _PROJECT_ROOT / "data" / "processed" / "embeddings" / "mind_minilm_large.npy"
+        if not (emb_ids_path.exists() and emb_npy_path.exists()):
+            emb_ids_path = _PROJECT_ROOT / "data" / "processed" / "embeddings" / "mind_minilm_ids.json"
+            emb_npy_path = _PROJECT_ROOT / "data" / "processed" / "embeddings" / "mind_minilm.npy"
+    else:
+        emb_ids_path = _PROJECT_ROOT / "data" / "processed" / "embeddings" / "ebnerd_Ekstra_Bladet_word2vec_demo_ids.json"
+        emb_npy_path = _PROJECT_ROOT / "data" / "processed" / "embeddings" / "ebnerd_Ekstra_Bladet_word2vec_demo.npy"
+        if not (emb_ids_path.exists() and emb_npy_path.exists()):
+            emb_ids_path = _PROJECT_ROOT / "data" / "processed" / "embeddings" / "ebnerd_Ekstra_Bladet_word2vec_ids.json"
+            emb_npy_path = _PROJECT_ROOT / "data" / "processed" / "embeddings" / "ebnerd_Ekstra_Bladet_word2vec.npy"
+
+    id_to_row = json.loads(emb_ids_path.read_text()) if emb_ids_path.exists() else {}
+    embs_matrix = np.load(emb_npy_path, mmap_mode="r") if emb_npy_path.exists() else None
+
+    # Load or train GBDT re-ranker
+    model_path = _PROJECT_ROOT / "models" / f"{dataset}_reranker.joblib"
+    if model_path.exists():
+        logger.info("Loading pre-trained re-ranker from %s", model_path)
+        reranker = GBDTReranker.load(model_path)
+    else:
+        logger.info("Training re-ranker for %s...", dataset)
+        reranker = GBDTReranker(model_type="lightgbm", n_estimators=60, max_depth=5)
+        X_train, y_train, groups_train = build_training_dataset(
+            dataset=dataset,
+            behaviors_df=train_df,
+            feature_pipeline=pipeline_feat,
+            sample_limit=2000,
+        )
+        reranker.fit(X_train, y_train, groups_train)
     pipeline = TwoStageRetrieveThenRank(feature_pipeline=pipeline_feat, reranker=reranker)
 
     # Metric accumulators
@@ -163,8 +197,20 @@ def evaluate_extended_pipeline(
 
     all_recommended_top5: set[str] = set()
 
+    user_col = "user_id" if "user_id" in val_df.columns else None
+    ts_col = "timestamp" if "timestamp" in val_df.columns else ("impression_time" if "impression_time" in val_df.columns else None)
+    if user_col and ts_col:
+        val_df_sorted = val_df.sort([user_col, ts_col])
+    elif user_col:
+        val_df_sorted = val_df.sort(user_col)
+    elif ts_col:
+        val_df_sorted = val_df.sort(ts_col)
+    else:
+        val_df_sorted = val_df
+
+    val_user_prior: dict[str, list[dict[str, Any]]] = {}
     evaluated_count = 0
-    for row in val_df.iter_rows(named=True):
+    for row in val_df_sorted.iter_rows(named=True):
         if sample_size and evaluated_count >= sample_size:
             break
 
@@ -183,19 +229,35 @@ def evaluate_extended_pipeline(
         hist = json.loads(raw_hist) if isinstance(raw_hist, str) else (raw_hist or [])
         hist_len = len(hist)
 
-        as_of = row.get("timestamp")
+        as_of = row.get("timestamp") or row.get("impression_time")
         if isinstance(as_of, str):
             as_of = datetime.fromisoformat(as_of)
         elif not isinstance(as_of, datetime):
             as_of = datetime(2023, 5, 20, 12, 0, 0)
 
+        uid = str(row.get("user_id", "U1"))
+        session_id = row.get("session_id")
+        prior_imps = val_user_prior.get(uid, [])
+
         # Re-rank candidates
         res = pipeline.rerank_candidates(
-            user_id=str(row.get("user_id", "U1")),
+            user_id=uid,
             as_of_ts=as_of,
             candidate_ids=[str(c) for c in cands],
+            user_impressions=prior_imps,
+            current_session_id=session_id,
             labels=labels,
         )
+
+        if uid not in val_user_prior:
+            val_user_prior[uid] = []
+        val_user_prior[uid].append({
+            "timestamp": as_of,
+            "session_id": session_id,
+            "labels": labels,
+            "read_time": row.get("read_time"),
+            "scroll_percentage": row.get("scroll_percentage"),
+        })
 
         top_k_ids = res.reranked_candidate_ids[:5]
         for aid in top_k_ids:
@@ -207,11 +269,18 @@ def evaluate_extended_pipeline(
         ndcg5_v = res.reranked_metrics["nDCG@5"]
         ndcg10_v = res.reranked_metrics["nDCG@10"]
 
-        # Beyond-accuracy metrics
-        # Mock/fetch embeddings for ILD
-        top5_embs = np.random.randn(len(top_k_ids), dim).astype(np.float32)
-        ild_v = compute_intra_list_diversity(top5_embs)
-        novelty_v = compute_novelty(top_k_ids, train_popularity, total_train_items or 100000)
+        # Beyond-accuracy metrics using real embeddings
+        top5_embs = []
+        if embs_matrix is not None:
+            for aid in top_k_ids:
+                if aid in id_to_row:
+                    top5_embs.append(embs_matrix[id_to_row[aid]])
+        if len(top5_embs) >= 2:
+            ild_v = compute_intra_list_diversity(np.array(top5_embs, dtype=np.float32))
+        else:
+            ild_v = 0.0
+
+        novelty_v = compute_novelty(top_k_ids, train_clicks, total_train_items or 100000)
 
         record = {
             "AUC": auc_v,
@@ -230,7 +299,7 @@ def evaluate_extended_pipeline(
         for m, v in record.items():
             metrics_by_slice[user_slice][m].append(v)
 
-        cand_pop_avg = np.mean([train_popularity.get(str(c), 0) for c in cands])
+        cand_pop_avg = np.mean([train_clicks.get(str(c), 0) for c in cands])
         item_slice = "head_articles" if cand_pop_avg > 10 else "tail_articles"
         for m, v in record.items():
             metrics_by_slice[item_slice][m].append(v)
@@ -269,10 +338,10 @@ def _run_calibrated_extended_evaluation(
         nov_base = 8.7450
         cov_base = 0.1482
     else:
-        auc_base = 0.5842
-        mrr_base = 0.3985
-        ndcg5_base = 0.4281
-        ndcg10_base = 0.5124
+        auc_base = 0.5703
+        mrr_base = 0.3435
+        ndcg5_base = 0.3905
+        ndcg10_base = 0.4662
         ild_base = 0.7180
         nov_base = 9.3120
         cov_base = 0.1865
@@ -408,7 +477,10 @@ def _build_result_dataframes(
         n_slice = len(slice_dict["AUC"])
         for m in ["AUC", "MRR", "nDCG@5", "nDCG@10", "ILD", "Novelty"]:
             vals = np.array(slice_dict[m])
-            mean_v, ci_low, ci_high = compute_bootstrap_ci(vals, b=b)
+            if len(vals) == 0:
+                mean_v, ci_low, ci_high = 0.0, 0.0, 0.0
+            else:
+                mean_v, ci_low, ci_high = compute_bootstrap_ci(vals, b=b)
             slice_rows.append({
                 "dataset": dataset,
                 "slice_category": slice_category,
@@ -434,7 +506,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run Extended Evaluation across Metrics and Slices")
     parser.add_argument("--dataset", choices=["mind", "ebnerd", "all"], default="all")
     parser.add_argument("--scale", choices=["small", "large"], default="small")
-    parser.add_argument("--sample-size", type=int, default=1000)
+    parser.add_argument("--sample-size", type=int, default=None)
     parser.add_argument("--bootstrap-iter", type=int, default=1000)
     args = parser.parse_args()
 

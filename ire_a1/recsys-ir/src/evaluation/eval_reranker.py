@@ -168,7 +168,19 @@ def run_evaluation_for_dataset(
     metrics_before = {"AUC": [], "MRR": [], "nDCG@5": [], "nDCG@10": []}
     metrics_after = {"AUC": [], "MRR": [], "nDCG@5": [], "nDCG@10": []}
 
-    val_rows = val_df.iter_rows(named=True)
+    user_col = "user_id" if "user_id" in val_df.columns else None
+    ts_col = "timestamp" if "timestamp" in val_df.columns else ("impression_time" if "impression_time" in val_df.columns else None)
+    if user_col and ts_col:
+        val_df_sorted = val_df.sort([user_col, ts_col])
+    elif user_col:
+        val_df_sorted = val_df.sort(user_col)
+    elif ts_col:
+        val_df_sorted = val_df.sort(ts_col)
+    else:
+        val_df_sorted = val_df
+
+    val_user_prior: dict[str, list[dict[str, Any]]] = {}
+    val_rows = val_df_sorted.iter_rows(named=True)
     val_count = 0
 
     for row in val_rows:
@@ -187,7 +199,7 @@ def run_evaluation_for_dataset(
         if sum(labels) == 0 or sum(labels) == len(labels):
             continue
 
-        ts = row.get("timestamp")
+        ts = row.get("timestamp") or row.get("impression_time")
         as_of = (
             datetime.fromisoformat(ts)
             if isinstance(ts, str)
@@ -203,11 +215,14 @@ def run_evaluation_for_dataset(
         if user_hist and isinstance(user_hist[0], str):
             user_hist = [{"article_id": aid, "clicked_at": None} for aid in user_hist]
 
+        prior_imps = val_user_prior.get(user_id, [])
+
         res = pipeline.rerank_candidates(
             user_id=user_id,
             as_of_ts=as_of,
             candidate_ids=cands,
             user_history=user_hist,
+            user_impressions=prior_imps,
             current_session_id=session_id,
             labels=labels,
         )
@@ -217,6 +232,16 @@ def run_evaluation_for_dataset(
             metrics_after[m].append(res.reranked_metrics[m])
 
         val_count += 1
+
+        if user_id not in val_user_prior:
+            val_user_prior[user_id] = []
+        val_user_prior[user_id].append({
+            "timestamp": as_of,
+            "session_id": session_id,
+            "labels": labels,
+            "read_time": row.get("read_time"),
+            "scroll_percentage": row.get("scroll_percentage"),
+        })
 
     # 6. Aggregate results
     summary = {

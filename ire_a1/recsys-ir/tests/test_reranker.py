@@ -175,3 +175,64 @@ def test_save_and_load_reranker():
         loaded = GBDTReranker.load(path)
         scores_after = loaded.predict_scores(X[:5])
         np.testing.assert_allclose(scores_before, scores_after)
+
+
+def test_rerank_duplicate_candidate_ids(mock_pipeline):
+    """Verify that duplicate candidate IDs in an impression preserve exact label alignment.
+
+    Previously, `label_map = dict(zip(cands, labels))` silently dropped or overwrote
+    labels for duplicate candidate IDs (e.g. overwriting clicked label with unclicked or vice-versa).
+    With index-aligned scoring, each candidate position retains its original ground-truth label.
+    """
+    class FixedScoreReranker:
+        def __init__(self, scores: list[float]):
+            self.scores = np.array(scores, dtype=np.float64)
+
+        def predict_scores(self, X):
+            return self.scores
+
+    # Impression with duplicate candidate "A1":
+    # Index 0: "A1" -> label 0 (not clicked)
+    # Index 1: "A2" -> label 0 (not clicked)
+    # Index 2: "A1" -> label 1 (clicked)
+    cands = ["A1", "A2", "A1"]
+    labels = [0, 0, 1]
+
+    # Model scores index 2 ("A1", clicked) highest (0.9), index 1 (0.4), index 0 (0.1)
+    reranker = FixedScoreReranker([0.1, 0.4, 0.9])
+    pipeline = TwoStageRetrieveThenRank(mock_pipeline, reranker)
+
+    result = pipeline.rerank_candidates(
+        user_id="U1",
+        as_of_ts=datetime(2023, 5, 20, 12, 0, 0),
+        candidate_ids=cands,
+        labels=labels,
+    )
+
+    # Reranked order: index 2 ("A1"), index 1 ("A2"), index 0 ("A1")
+    assert result.reranked_candidate_ids == ["A1", "A2", "A1"]
+    assert result.reranked_scores == [0.9, 0.4, 0.1]
+    # Index 2 was clicked (label 1), now at rank 0 -> MRR = 1.0, nDCG@5 = 1.0
+    assert result.reranked_metrics["MRR"] == 1.0
+    assert result.reranked_metrics["nDCG@5"] == 1.0
+
+    # Converse case: Index 0 ("A1") is clicked, Index 2 ("A1") is unclicked
+    # Under old buggy dict(zip(cands, labels)), label_map["A1"] was overwritten to 0,
+    # completely wiping out the click and yielding MRR = 0.0!
+    labels_converse = [1, 0, 0]
+    reranker_converse = FixedScoreReranker([0.9, 0.4, 0.1])
+    pipeline_converse = TwoStageRetrieveThenRank(mock_pipeline, reranker_converse)
+
+    result_converse = pipeline_converse.rerank_candidates(
+        user_id="U1",
+        as_of_ts=datetime(2023, 5, 20, 12, 0, 0),
+        candidate_ids=cands,
+        labels=labels_converse,
+    )
+
+    # Index 0 is ranked top with its true label 1 preserved
+    assert result_converse.reranked_candidate_ids == ["A1", "A2", "A1"]
+    assert result_converse.reranked_scores == [0.9, 0.4, 0.1]
+    assert result_converse.reranked_metrics["MRR"] == 1.0
+    assert result_converse.reranked_metrics["nDCG@5"] == 1.0
+

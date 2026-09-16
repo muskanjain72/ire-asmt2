@@ -24,10 +24,22 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
+
+# Single-request latency simulation: limit OpenMP threads to prevent thread contention overhead
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+from contextlib import nullcontext
 from pathlib import Path
 import sys
 import time
 from typing import Any
+
+try:
+    import threadpoolctl
+except ImportError:
+    threadpoolctl = None
 
 import numpy as np
 import polars as pl
@@ -214,61 +226,67 @@ def run_latency_benchmark(
         for i in range(15)
     ]
 
-    for k in candidate_pools:
-        candidates = [f"A_CAND_{i}" for i in range(k)]
-        candidate_sims = {cid: float(np.random.uniform(0.4, 0.95)) for cid in candidates}
+    thread_ctx = (
+        threadpoolctl.threadpool_limits(limits=1)
+        if threadpoolctl is not None
+        else nullcontext()
+    )
+    with thread_ctx:
+        for k in candidate_pools:
+            candidates = [f"A_CAND_{i}" for i in range(k)]
+            candidate_sims = {cid: float(np.random.uniform(0.4, 0.95)) for cid in candidates}
 
-        t_stage1_list: list[float] = []
-        t_feat_list: list[float] = []
-        t_stage2_list: list[float] = []
-        t_total_list: list[float] = []
+            t_stage1_list: list[float] = []
+            t_feat_list: list[float] = []
+            t_stage2_list: list[float] = []
+            t_total_list: list[float] = []
 
-        total_runs = warmup_iterations + n_iterations
-        for run_idx in range(total_runs):
-            # --- Stage 1 Retrieval Simulation ---
-            t0 = time.perf_counter_ns()
-            _ = np.dot(np.random.randn(k, dim).astype(np.float32), query_vector)
-            t1 = time.perf_counter_ns()
+            total_runs = warmup_iterations + n_iterations
+            for run_idx in range(total_runs):
+                # --- Stage 1 Retrieval Simulation ---
+                t0 = time.perf_counter_ns()
+                _ = np.dot(np.random.randn(k, dim).astype(np.float32), query_vector)
+                t1 = time.perf_counter_ns()
 
-            # --- Feature Extraction Simulation ---
-            X = pipeline.feature_pipeline.extract_impression_features(
-                user_id=user_id,
-                as_of_ts=as_of,
-                candidate_ids=candidates,
-                user_history=user_history,
-                current_session_id=session_id,
-                embed_scores=candidate_sims,
-            )
-            t2 = time.perf_counter_ns()
+                # --- Feature Extraction Simulation ---
+                X = pipeline.feature_pipeline.extract_impression_features(
+                    user_id=user_id,
+                    as_of_ts=as_of,
+                    candidate_ids=candidates,
+                    user_history=user_history,
+                    current_session_id=session_id,
+                    embed_scores=candidate_sims,
+                )
+                t2 = time.perf_counter_ns()
 
-            # --- Stage 2 Re-Ranking Inference ---
-            _ = pipeline.reranker.predict_scores(X)
-            t3 = time.perf_counter_ns()
+                # --- Stage 2 Re-Ranking Inference ---
+                _ = pipeline.reranker.predict_scores(X)
+                t3 = time.perf_counter_ns()
 
-            if run_idx >= warmup_iterations:
-                t_stage1_list.append((t1 - t0) / 1e6)   # ms
-                t_feat_list.append((t2 - t1) / 1e6)     # ms
-                t_stage2_list.append((t3 - t2) / 1e6)   # ms
-                t_total_list.append((t3 - t0) / 1e6)    # ms
+                if run_idx >= warmup_iterations:
+                    t_stage1_list.append((t1 - t0) / 1e6)   # ms
+                    t_feat_list.append((t2 - t1) / 1e6)     # ms
+                    t_stage2_list.append((t3 - t2) / 1e6)   # ms
+                    t_total_list.append((t3 - t0) / 1e6)    # ms
 
-        results[k] = {
-            "k": k,
-            "stage1_p50_ms": float(np.percentile(t_stage1_list, 50)),
-            "stage1_p90_ms": float(np.percentile(t_stage1_list, 90)),
-            "stage1_p99_ms": float(np.percentile(t_stage1_list, 99)),
-            "features_p50_ms": float(np.percentile(t_feat_list, 50)),
-            "features_p90_ms": float(np.percentile(t_feat_list, 90)),
-            "features_p99_ms": float(np.percentile(t_feat_list, 99)),
-            "stage2_p50_ms": float(np.percentile(t_stage2_list, 50)),
-            "stage2_p90_ms": float(np.percentile(t_stage2_list, 90)),
-            "stage2_p99_ms": float(np.percentile(t_stage2_list, 99)),
-            "total_p50_ms": float(np.percentile(t_total_list, 50)),
-            "total_p90_ms": float(np.percentile(t_total_list, 90)),
-            "total_p95_ms": float(np.percentile(t_total_list, 95)),
-            "total_p99_ms": float(np.percentile(t_total_list, 99)),
-            "total_mean_ms": float(np.mean(t_total_list)),
-            "total_std_ms": float(np.std(t_total_list)),
-        }
+            results[k] = {
+                "k": k,
+                "stage1_p50_ms": float(np.percentile(t_stage1_list, 50)),
+                "stage1_p90_ms": float(np.percentile(t_stage1_list, 90)),
+                "stage1_p99_ms": float(np.percentile(t_stage1_list, 99)),
+                "features_p50_ms": float(np.percentile(t_feat_list, 50)),
+                "features_p90_ms": float(np.percentile(t_feat_list, 90)),
+                "features_p99_ms": float(np.percentile(t_feat_list, 99)),
+                "stage2_p50_ms": float(np.percentile(t_stage2_list, 50)),
+                "stage2_p90_ms": float(np.percentile(t_stage2_list, 90)),
+                "stage2_p99_ms": float(np.percentile(t_stage2_list, 99)),
+                "total_p50_ms": float(np.percentile(t_total_list, 50)),
+                "total_p90_ms": float(np.percentile(t_total_list, 90)),
+                "total_p95_ms": float(np.percentile(t_total_list, 95)),
+                "total_p99_ms": float(np.percentile(t_total_list, 99)),
+                "total_mean_ms": float(np.mean(t_total_list)),
+                "total_std_ms": float(np.std(t_total_list)),
+            }
 
     return results
 

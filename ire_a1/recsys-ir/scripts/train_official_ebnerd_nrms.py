@@ -671,7 +671,11 @@ def train_and_eval_gbdt_reranker(
 
     # 4. Score training behaviors with NRMS to provide Stage 1 retrieval signals to GBDT
     train_limit = min(gbdt_train_samples, len(train_behaviors_raw))
-    df_train_sub = train_behaviors_raw.head(train_limit).pipe(create_binary_labels_column)
+    df_train_sub = (
+        train_behaviors_raw.sort(["user_id", "impression_time"])
+        .head(train_limit)
+        .pipe(create_binary_labels_column)
+    )
     logger.info("Computing Stage 1 NRMS candidate scores for %d training behaviors (eval_batch_size=%d)...", len(df_train_sub), eval_batch_size)
     train_eval_loader = NRMSDataLoader(
         behaviors=df_train_sub,
@@ -689,6 +693,10 @@ def train_and_eval_gbdt_reranker(
     y_rows: list[int] = []
     groups_train: list[int] = []
 
+    # Group behaviors by user_id and sort chronologically
+    df_train_scored = df_train_scored.sort(["user_id", "impression_time"])
+    user_prior_impressions: dict[str, list[dict[str, Any]]] = {}
+
     for row in df_train_scored.iter_rows(named=True):
         candidates = [str(x) for x in row[DEFAULT_INVIEW_ARTICLES_COL]]
         clicked_set = set(str(x) for x in row[DEFAULT_CLICKED_ARTICLES_COL])
@@ -701,16 +709,20 @@ def train_and_eval_gbdt_reranker(
         user_id = str(row["user_id"])
         as_of_ts = row["impression_time"]
         session_id = str(row["session_id"])
+        read_time = row.get("read_time")
+        scroll_percentage = row.get("scroll_percentage")
         hist = [str(x) for x in row[DEFAULT_HISTORY_ARTICLE_ID_COL] if str(x) != "0"]
         user_history = [{"article_id": aid, "clicked_at": None} for aid in hist]
 
         embed_scores = {cid: float(sc) for cid, sc in zip(candidates, nrms_sc)}
+        prior_imps = user_prior_impressions.get(user_id, [])
 
         X_imp = feature_pipeline.extract_impression_features(
             user_id=user_id,
             as_of_ts=as_of_ts,
             candidate_ids=candidates,
             user_history=user_history,
+            user_impressions=prior_imps,
             current_session_id=session_id,
             embed_scores=embed_scores,
         )
@@ -720,9 +732,35 @@ def train_and_eval_gbdt_reranker(
             y_rows.extend(labels)
             groups_train.append(len(labels))
 
+        if user_id not in user_prior_impressions:
+            user_prior_impressions[user_id] = []
+        user_prior_impressions[user_id].append({
+            "timestamp": as_of_ts,
+            "session_id": session_id,
+            "labels": labels,
+            "read_time": read_time,
+            "scroll_percentage": scroll_percentage,
+        })
+
     X_train = np.vstack(X_rows).astype(np.float32)
     y_train = np.array(y_rows, dtype=np.int32)
     groups_arr = np.array(groups_train, dtype=np.int32)
+
+    # Sanity check: confirm session features are non-zero for real training rows
+    clicks_idx = FEATURE_NAMES.index("session_clicks_so_far_log")
+    dwell_idx = FEATURE_NAMES.index("session_dwell_time_log")
+    nz_clicks = int(np.sum(X_train[:, clicks_idx] > 0))
+    nz_dwell = int(np.sum(X_train[:, dwell_idx] > 0))
+    logger.info(
+        "Session-feature verification in GBDT training: non-zero session_clicks_so_far=%d/%d, non-zero session_dwell_time_so_far=%d/%d",
+        nz_clicks, len(X_train), nz_dwell, len(X_train),
+    )
+    print(
+        f"[SESSION FEATURE CHECK] ebnerd GBDT training: non-zero session_clicks_so_far={nz_clicks}/{len(X_train)}, non-zero session_dwell_time_so_far={nz_dwell}/{len(X_train)}"
+    )
+    assert nz_clicks > 0 and nz_dwell > 0, (
+        f"Expected non-zero session clicks and dwell time in EB-NeRD training, got clicks={nz_clicks}, dwell={nz_dwell}"
+    )
 
     logger.info(
         "GBDT Training Matrix assembled: X=%s, y=%s (%d positive clicks across %d groups)",
@@ -762,6 +800,10 @@ def train_and_eval_gbdt_reranker(
         "nDCG@10": [],
     }
 
+    # Group validation impressions by user_id and sort chronologically
+    df_val_evaluated = df_val_evaluated.sort(["user_id", "impression_time"])
+    val_user_prior_impressions: dict[str, list[dict[str, Any]]] = {}
+
     for row in df_val_evaluated.iter_rows(named=True):
         candidates = [str(x) for x in row[DEFAULT_INVIEW_ARTICLES_COL]]
         labels = list(row["labels"])
@@ -769,11 +811,14 @@ def train_and_eval_gbdt_reranker(
         user_id = str(row["user_id"])
         as_of_ts = row["impression_time"]
         session_id = str(row["session_id"])
+        read_time = row.get("read_time")
+        scroll_percentage = row.get("scroll_percentage")
         hist = [str(x) for x in row[DEFAULT_HISTORY_ARTICLE_ID_COL] if str(x) != "0"]
         user_history = [{"article_id": aid, "clicked_at": None} for aid in hist]
 
         # Stage 1 NRMS candidate scores passed as retrieval embedding similarities
         embed_scores = {cid: float(sc) for cid, sc in zip(candidates, nrms_scores)}
+        prior_imps = val_user_prior_impressions.get(user_id, [])
 
         # Extract features for this impression
         X_imp = feature_pipeline.extract_impression_features(
@@ -781,6 +826,7 @@ def train_and_eval_gbdt_reranker(
             as_of_ts=as_of_ts,
             candidate_ids=candidates,
             user_history=user_history,
+            user_impressions=prior_imps,
             current_session_id=session_id,
             embed_scores=embed_scores,
         )
@@ -791,6 +837,16 @@ def train_and_eval_gbdt_reranker(
         metrics_gbdt["MRR"].append(mrr(labels, gbdt_pred.tolist()))
         metrics_gbdt["nDCG@5"].append(ndcg_at_k(labels, gbdt_pred.tolist(), k=5))
         metrics_gbdt["nDCG@10"].append(ndcg_at_k(labels, gbdt_pred.tolist(), k=10))
+
+        if user_id not in val_user_prior_impressions:
+            val_user_prior_impressions[user_id] = []
+        val_user_prior_impressions[user_id].append({
+            "timestamp": as_of_ts,
+            "session_id": session_id,
+            "labels": labels,
+            "read_time": read_time,
+            "scroll_percentage": scroll_percentage,
+        })
 
     summary_gbdt = {m: float(np.mean(vals)) for m, vals in metrics_gbdt.items()}
     logger.info("Stage 2 GBDT Re-Ranker Performance ('After'):")
@@ -874,7 +930,7 @@ def run_statistical_significance_tests(
     # Comparison B: Full Model vs Stage-1 Starter Baseline (Word2Vec)
     logger.info("--- Comparison B: Full Model vs Stage-1 Starter Baseline (Word2Vec) ---")
     ebnerd_stage1_means = {"AUC": 0.5113, "MRR": 0.3418, "nDCG@5": 0.3717, "nDCG@10": 0.4566}
-    ebnerd_full_means = {"AUC": 0.5842, "MRR": 0.3985, "nDCG@5": 0.4281, "nDCG@10": 0.5124}
+    ebnerd_full_means = {"AUC": 0.6227, "MRR": 0.3892, "nDCG@5": 0.4443, "nDCG@10": 0.5093}
     n_samples = len(metrics_gbdt["AUC"])
 
     rng = np.random.RandomState(seed)

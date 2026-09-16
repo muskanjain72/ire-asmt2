@@ -138,8 +138,9 @@ def evaluate_model_on_impressions(
         reranked_ids = [pair[2] for pair in scored_pairs]
         reranked_scores = [float(pair[0]) for pair in scored_pairs]
 
-        label_map = dict(zip(cands, labels))
-        reranked_labels = [label_map[cid] for cid in reranked_ids]
+        scored = [(pred_scores[i], i, cands[i], labels[i]) for i in range(len(cands))]
+        scored.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+        reranked_labels = [item[3] for item in scored]
 
         metrics_model["AUC"].append(float(auc_score(reranked_labels, reranked_scores)))
         metrics_model["MRR"].append(float(mrr(reranked_labels, reranked_scores)))
@@ -214,8 +215,20 @@ def run_ablation_and_bootstrap_study(
     pipeline = TwoStageRetrieveThenRank(feature_pipeline, reranker)
 
     # Prepare validation impression objects
+    user_col = "user_id" if "user_id" in val_df.columns else None
+    ts_col = "timestamp" if "timestamp" in val_df.columns else ("impression_time" if "impression_time" in val_df.columns else None)
+    if user_col and ts_col:
+        val_df_sorted = val_df.sort([user_col, ts_col])
+    elif user_col:
+        val_df_sorted = val_df.sort(user_col)
+    elif ts_col:
+        val_df_sorted = val_df.sort(ts_col)
+    else:
+        val_df_sorted = val_df
+
+    val_user_prior: dict[str, list[dict[str, Any]]] = {}
     val_impressions = []
-    for row in val_df.iter_rows(named=True):
+    for row in val_df_sorted.iter_rows(named=True):
         if len(val_impressions) >= sample_limit:
             break
         cands_raw = row.get("candidates")
@@ -227,7 +240,7 @@ def run_ablation_and_bootstrap_study(
         if sum(labels) == 0 or sum(labels) == len(labels):
             continue
 
-        ts = row.get("timestamp")
+        ts = row.get("timestamp") or row.get("impression_time")
         as_of = (
             datetime.fromisoformat(ts)
             if isinstance(ts, str)
@@ -238,13 +251,28 @@ def run_ablation_and_bootstrap_study(
         if u_hist and isinstance(u_hist[0], str):
             u_hist = [{"article_id": aid, "clicked_at": None} for aid in u_hist]
 
+        uid = str(row.get("user_id", "U1"))
+        session_id = row.get("session_id")
+        prior_imps = val_user_prior.get(uid, [])
+
         val_impressions.append({
-            "user_id": str(row.get("user_id", "U1")),
+            "user_id": uid,
             "as_of_ts": as_of,
             "candidates": cands,
             "labels": labels,
             "user_history": u_hist,
-            "session_id": row.get("session_id"),
+            "user_impressions": list(prior_imps),
+            "session_id": session_id,
+        })
+
+        if uid not in val_user_prior:
+            val_user_prior[uid] = []
+        val_user_prior[uid].append({
+            "timestamp": as_of,
+            "session_id": session_id,
+            "labels": labels,
+            "read_time": row.get("read_time"),
+            "scroll_percentage": row.get("scroll_percentage"),
         })
 
     # Run Ablation and Bootstrap

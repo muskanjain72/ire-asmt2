@@ -137,9 +137,10 @@ class TwoStageRetrieveThenRank:
                 "nDCG@10": float(ndcg_at_k(labels, orig_scores, k=10)),
             }
 
-            # Map labels to the reranked candidate order
-            label_map = dict(zip(cands, labels))
-            reranked_labels = [label_map[cid] for cid in reranked_ids]
+            # Map labels to the reranked candidate order using index alignment
+            scored = [(pred_scores[i], i, cands[i], labels[i]) for i in range(len(cands))]
+            scored.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+            reranked_labels = [item[3] for item in scored]
 
             reranked_metrics = {
                 "AUC": float(auc_score(reranked_labels, reranked_scores)),

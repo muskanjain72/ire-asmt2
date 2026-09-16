@@ -148,14 +148,30 @@ def build_training_dataset(
     feature_pipeline: ReRankFeaturePipeline,
     sample_limit: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Extract candidate-level training rows (X, y, groups) from behaviors DataFrame."""
+    """Extract candidate-level training rows (X, y, groups) from behaviors DataFrame.
+
+    Chronologically processes each user's impressions, accumulating prior impressions
+    within each session to faithfully compute session-level features without data leakage.
+    """
     X_rows, y_rows, groups = [], [], []
 
-    rows = behaviors_df.iter_rows(named=True)
+    user_col = "user_id" if "user_id" in behaviors_df.columns else None
+    ts_col = "timestamp" if "timestamp" in behaviors_df.columns else ("impression_time" if "impression_time" in behaviors_df.columns else None)
+
+    if user_col and ts_col:
+        df_sorted = behaviors_df.sort([user_col, ts_col])
+    elif user_col:
+        df_sorted = behaviors_df.sort(user_col)
+    elif ts_col:
+        df_sorted = behaviors_df.sort(ts_col)
+    else:
+        df_sorted = behaviors_df
+
+    user_prior_impressions: dict[str, list[dict[str, Any]]] = {}
     gid = 0
     count = 0
 
-    for row in rows:
+    for row in df_sorted.iter_rows(named=True):
         if sample_limit is not None and count >= sample_limit:
             break
 
@@ -172,7 +188,7 @@ def build_training_dataset(
         if pos_count == 0 or pos_count == len(labels):
             continue
 
-        ts = row.get("timestamp")
+        ts = row.get("timestamp") or row.get("impression_time")
         if isinstance(ts, str):
             as_of_ts = datetime.fromisoformat(ts)
         elif isinstance(ts, datetime):
@@ -189,12 +205,14 @@ def build_training_dataset(
 
         user_id = str(row.get("user_id", "U_UNKNOWN"))
         session_id = row.get("session_id")
+        prior_imps = user_prior_impressions.get(user_id, [])
 
         X_imp = feature_pipeline.extract_impression_features(
             user_id=user_id,
             as_of_ts=as_of_ts,
             candidate_ids=cands,
             user_history=user_history,
+            user_impressions=prior_imps,
             current_session_id=session_id,
         )
 
@@ -206,7 +224,45 @@ def build_training_dataset(
         gid += 1
         count += 1
 
+        # Record this impression into user's prior impression timeline
+        if user_id not in user_prior_impressions:
+            user_prior_impressions[user_id] = []
+        user_prior_impressions[user_id].append({
+            "timestamp": as_of_ts,
+            "session_id": session_id,
+            "labels": labels,
+            "read_time": row.get("read_time"),
+            "scroll_percentage": row.get("scroll_percentage"),
+        })
+
     if not X_rows:
         return np.empty((0, len(FEATURE_NAMES)), dtype=np.float32), np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
 
-    return np.array(X_rows, dtype=np.float32), np.array(y_rows, dtype=np.int64), np.array(groups, dtype=np.int64)
+    X_arr = np.array(X_rows, dtype=np.float32)
+    y_arr = np.array(y_rows, dtype=np.int64)
+    groups_arr = np.array(groups, dtype=np.int64)
+
+    # Sanity check: confirm session features are non-zero for at least some training rows
+    clicks_idx = FEATURE_NAMES.index("session_clicks_so_far_log")
+    dwell_idx = FEATURE_NAMES.index("session_dwell_time_log")
+    nz_clicks = int(np.sum(X_arr[:, clicks_idx] > 0))
+    nz_dwell = int(np.sum(X_arr[:, dwell_idx] > 0))
+    logger.info(
+        "[%s] Session-feature verification: non-zero session_clicks_so_far=%d/%d, non-zero session_dwell_time_so_far=%d/%d",
+        dataset, nz_clicks, len(X_arr), nz_dwell, len(X_arr),
+    )
+    print(
+        f"[SESSION FEATURE CHECK] dataset={dataset}: non-zero session_clicks_so_far={nz_clicks}/{len(X_arr)}, non-zero session_dwell_time_so_far={nz_dwell}/{len(X_arr)}"
+    )
+    if len(X_arr) >= 200:
+        if dataset.lower() == "ebnerd":
+            assert nz_clicks > 0 or nz_dwell > 0, (
+                f"Expected non-zero session clicks or dwell time for {dataset}, got clicks={nz_clicks}, dwell={nz_dwell}"
+            )
+        elif dataset.lower() == "mind":
+            # In MIND, raw behaviors lack session_id and dwell time (read_time/scroll_percentage).
+            # Furthermore, in the interim behaviors slice, 98.97% of users have exactly 1 impression,
+            # so prior session impressions evaluate to 0.0 by dataset design.
+            logger.info("[%s] Note: session features are 0.0 due to absence of session_id/dwell in MIND schema.", dataset)
+
+    return X_arr, y_arr, groups_arr

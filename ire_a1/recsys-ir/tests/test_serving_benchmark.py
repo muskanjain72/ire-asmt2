@@ -70,6 +70,9 @@ def test_calculate_cost_and_qps():
 
 def test_e2e_serving_benchmarks():
     """Verify run_serving_benchmarks runs end-to-end and outputs structured DataFrames."""
+    # Warmup phase: 2-3 iterations so cold-start JIT and cache warmup don't pollute p99 measurements
+    _ = run_serving_benchmarks(dataset="mind", n_iterations=3)
+
     df_serv, df_lat = run_serving_benchmarks(dataset="mind", n_iterations=15)
     assert len(df_serv) == 3  # K=50, 100, 200
     assert len(df_lat) == 3
