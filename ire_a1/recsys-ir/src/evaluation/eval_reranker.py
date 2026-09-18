@@ -63,6 +63,37 @@ def load_dataset_popularity(
     return clicks, inviews
 
 
+def load_stage1_score_maps(dataset: str) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
+    """Load Stage-1 embed and BM25 candidate score maps keyed by impression_id."""
+    embed_scores_map: dict[str, dict[str, float]] = {}
+    bm25_scores_map: dict[str, dict[str, float]] = {}
+
+    p_dir = _PROJECT_ROOT / "data" / "processed"
+
+    if dataset.lower() == "mind":
+        embed_p = p_dir / "embed_scores_mind_minilm.parquet"
+        bm25_p = p_dir / "bm25_scores_mind_title_abstract.parquet"
+    else:
+        embed_p = p_dir / "embed_scores_ebnerd_w2v.parquet"
+        bm25_p = p_dir / "bm25_scores_ebnerd_title_abstract.parquet"
+
+    for p, target_map in [(embed_p, embed_scores_map), (bm25_p, bm25_scores_map)]:
+        if p.exists():
+            try:
+                df = pl.read_parquet(p, columns=["impression_id", "ranked_ids", "scores"])
+                for row in df.iter_rows(named=True):
+                    imp_id = str(row["impression_id"])
+                    raw_cands = row["ranked_ids"]
+                    raw_scs = row["scores"]
+                    cands = json.loads(raw_cands) if isinstance(raw_cands, str) else list(raw_cands)
+                    scs = json.loads(raw_scs) if isinstance(raw_scs, str) else list(raw_scs)
+                    target_map[imp_id] = dict(zip([str(c) for c in cands], [float(s) for s in scs]))
+            except Exception as e:
+                logger.warning("Could not load stage-1 scores from %s: %s", p, e)
+
+    return embed_scores_map, bm25_scores_map
+
+
 def run_evaluation_for_dataset(
     dataset: str,
     scale: str = "small",
@@ -92,11 +123,11 @@ def run_evaluation_for_dataset(
     has_real_data = beh_path.exists() and art_path.exists()
 
     if not has_real_data:
-        logger.warning(
-            "Interim data not found at %s. Creating synthetic benchmark split for verification.",
-            beh_path,
+        raise FileNotFoundError(
+            f"Interim data not found at {beh_path} (or article_features at {art_path}). "
+            f"Run 'make data' (and 'make features') first to build the pipeline, "
+            f"or check DATA_SCALE — currently configured for scale={scale!r}."
         )
-        return _run_synthetic_benchmark(dataset)
 
     # 2. Load articles & behaviors
     article_store = ArticleFeatureStore(dataset, processed_dir=p_dir, scale=scale)
@@ -135,12 +166,21 @@ def run_evaluation_for_dataset(
     )
 
     # 4. Extract training data & Fit Re-Ranker
+    logger.info("Loading Stage-1 retrieval scores for %s...", dataset)
+    embed_map, bm25_map = load_stage1_score_maps(dataset)
+    logger.info(
+        "Stage-1 scores loaded: embed_impressions=%d, bm25_impressions=%d",
+        len(embed_map), len(bm25_map),
+    )
+
     logger.info("Extracting features for training re-ranker...")
     X_train, y_train, groups_train = build_training_dataset(
         dataset=dataset,
         behaviors_df=train_df,
         feature_pipeline=feature_pipeline,
         sample_limit=train_sample,
+        embed_scores_map=embed_map,
+        bm25_scores_map=bm25_map,
     )
 
     reranker = GBDTReranker(
@@ -217,6 +257,10 @@ def run_evaluation_for_dataset(
 
         prior_imps = val_user_prior.get(user_id, [])
 
+        imp_id = str(row.get("impression_id", ""))
+        e_scores = embed_map.get(imp_id)
+        b_scores = bm25_map.get(imp_id)
+
         res = pipeline.rerank_candidates(
             user_id=user_id,
             as_of_ts=as_of,
@@ -224,6 +268,8 @@ def run_evaluation_for_dataset(
             user_history=user_hist,
             user_impressions=prior_imps,
             current_session_id=session_id,
+            embed_scores=e_scores,
+            bm25_scores=b_scores,
             labels=labels,
         )
 

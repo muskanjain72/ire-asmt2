@@ -62,12 +62,24 @@ def test_rerank_feature_pipeline_shape_and_columns(mock_pipeline):
     assert not np.isnan(X).any()
     assert not np.isinf(X).any()
 
-    # Check that Q1 history embedding similarity was populated
+    # Check that Q1 history embedding similarity was populated for warm user
     idx_sim = FEATURE_NAMES.index("user_history_embedding_similarity")
     idx_max_sim = FEATURE_NAMES.index("user_history_max_embedding_sim")
     assert math.isclose(X[0, idx_sim], 0.8, rel_tol=1e-4)
     assert math.isclose(X[0, idx_max_sim], 0.8, rel_tol=1e-4)
     assert math.isclose(X[2, idx_sim], 0.6, rel_tol=1e-4)
+
+    # Check that truly cold user (no history) strictly receives 0.0 for history embedding similarity
+    X_cold = mock_pipeline.extract_impression_features(
+        user_id="U_COLD",
+        as_of_ts=as_of,
+        candidate_ids=cands,
+        user_history=[],
+        embed_scores={"A1": 0.8, "A3": 0.6},
+    )
+    assert X_cold[0, idx_sim] == 0.0
+    assert X_cold[0, idx_max_sim] == 0.0
+    assert X_cold[2, idx_sim] == 0.0
 
 
 def test_gbdt_reranker_fit_and_predict():

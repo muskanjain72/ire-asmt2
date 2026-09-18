@@ -119,8 +119,11 @@ def evaluate_extended_pipeline(
     has_real_data = art_path.exists() and beh_path.exists()
 
     if not has_real_data:
-        logger.warning("Parquet files unbuilt at %s. Running calibrated empirical evaluation.", beh_path)
-        return _run_calibrated_extended_evaluation(dataset, catalog_size=catalog_size, b=b_bootstrap)
+        raise FileNotFoundError(
+            f"Parquet files missing at {beh_path} or {art_path}. "
+            f"Run 'make data' and 'make features' first. "
+            f"Check DATA_SCALE — currently configured for scale={scale!r}."
+        )
 
     # Load real article store and behaviors
     art_store = ArticleFeatureStore(dataset=dataset, processed_dir=p_dir)

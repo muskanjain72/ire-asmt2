@@ -147,11 +147,15 @@ def build_training_dataset(
     behaviors_df: pl.DataFrame,
     feature_pipeline: ReRankFeaturePipeline,
     sample_limit: int | None = None,
+    embed_scores_map: dict[str, dict[str, float]] | None = None,
+    bm25_scores_map: dict[str, dict[str, float]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract candidate-level training rows (X, y, groups) from behaviors DataFrame.
 
     Chronologically processes each user's impressions, accumulating prior impressions
     within each session to faithfully compute session-level features without data leakage.
+    If embed_scores_map or bm25_scores_map is provided, populates the Stage-1 retrieval
+    signals (retrieval_bm25_score, retrieval_embed_sim, retrieval_hybrid_score).
     """
     X_rows, y_rows, groups = [], [], []
 
@@ -207,6 +211,10 @@ def build_training_dataset(
         session_id = row.get("session_id")
         prior_imps = user_prior_impressions.get(user_id, [])
 
+        imp_id = str(row.get("impression_id", ""))
+        e_scores = embed_scores_map.get(imp_id) if embed_scores_map else None
+        b_scores = bm25_scores_map.get(imp_id) if bm25_scores_map else None
+
         X_imp = feature_pipeline.extract_impression_features(
             user_id=user_id,
             as_of_ts=as_of_ts,
@@ -214,6 +222,8 @@ def build_training_dataset(
             user_history=user_history,
             user_impressions=prior_imps,
             current_session_id=session_id,
+            embed_scores=e_scores,
+            bm25_scores=b_scores,
         )
 
         for i in range(len(cands)):

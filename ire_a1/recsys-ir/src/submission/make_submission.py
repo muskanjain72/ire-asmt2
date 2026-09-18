@@ -15,8 +15,11 @@ import argparse
 import logging
 import time
 import zipfile
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import polars as pl
 
 from src.feature_store.history_store import MemoryMappedHistoryStore
@@ -33,6 +36,19 @@ from src.retrieval.embeddings import load_embeddings
 from src.retrieval.user_representation import build_mean_user_vectors
 from src.submission.package_submission import package_prediction
 from src.submission.writers import write_ranked_impression
+
+# Stage-2 GBDT reranker (EB-NeRD only; MIND skips reranking — see Proposal 3 rationale)
+try:
+    from src.feature_store.article_store import ArticleFeatureStore
+    from src.feature_store.behavioral_features import BehavioralFeatureExtractor
+    from src.feature_store.session_features import PositionBiasModel, SessionFeatureExtractor
+    from src.reranking.feature_pipeline import ReRankFeaturePipeline
+    from src.reranking.train_reranker import GBDTReranker
+    from src.reranking.rerank_pipeline import TwoStageRetrieveThenRank
+    from src.evaluation.eval_reranker import load_dataset_popularity
+    HAS_RERANKER = True
+except ImportError:
+    HAS_RERANKER = False
 
 logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -204,6 +220,77 @@ def _history_batches(
     return eb_history.get_histories([item.user_id for item in batch], [item.timestamp for item in batch])
 
 
+def _load_reranker_pipeline(dataset: str) -> TwoStageRetrieveThenRank | None:
+    """Load the trained GBDT reranker pipeline for Stage-2 re-ranking.
+
+    Returns None if the reranker module is unavailable or the saved model
+    doesn't exist, so that submission can fall back to Stage-1 ranking.
+    For MIND: always returns None (GBDT hurts MIND — see implementation plan).
+    For EB-NeRD: loads the trained ebnerd_reranker.joblib and wires it into
+    a feature pipeline backed by the small-scale processed article store.
+    """
+    if dataset == "mind":
+        # MIND GBDT is intentionally skipped: standalone GBDT AUC 0.4823 vs
+        # NRMS-only 0.6338. Until retrieval scores are plumbed (Proposal 2),
+        # Stage-1 embedding ranking is the best MIND model.
+        logger.info("MIND: using Stage-1 embedding ranking (GBDT skipped per Proposal 3).")
+        return None
+
+    if not HAS_RERANKER:
+        logger.warning("Reranker module unavailable — falling back to Stage-1 ranking.")
+        return None
+
+    model_path = _PROJECT_ROOT / "models" / f"{dataset}_reranker.joblib"
+    if not model_path.exists():
+        logger.warning("No trained reranker at %s — falling back to Stage-1 ranking.", model_path)
+        return None
+
+    # Feature stores: use small-scale processed data (article_features.parquet)
+    # which holds freshness, category, popularity priors fitted on training split.
+    p_dir = _PROJECT_ROOT / "data" / "processed" / dataset
+    i_dir = _PROJECT_ROOT / "data" / "interim" / dataset
+    art_path = p_dir / "article_features.parquet"
+    beh_path = i_dir / "behaviors.parquet"
+
+    if not art_path.exists():
+        logger.warning("Article features missing at %s — falling back to Stage-1.", art_path)
+        return None
+
+    article_store = ArticleFeatureStore(dataset=dataset, processed_dir=p_dir)
+
+    # Fit position bias and popularity priors from training split (no leakage)
+    if beh_path.exists():
+        df_beh = pl.read_parquet(beh_path)
+        train_df = df_beh.filter(pl.col("split") == "train") if "split" in df_beh.columns else df_beh
+        train_clicks, train_inviews = load_dataset_popularity(train_df)
+        pos_model = PositionBiasModel.fit_from_training_behaviors(train_df)
+    else:
+        logger.warning("Behaviors parquet missing at %s — using default position bias priors.", beh_path)
+        train_clicks, train_inviews = {}, {}
+        pos_model = PositionBiasModel()
+
+    behavioral_extractor = BehavioralFeatureExtractor(
+        dataset=dataset,
+        article_store=article_store,
+        train_popularity=train_clicks,
+        train_inviews=train_inviews,
+    )
+    session_extractor = SessionFeatureExtractor(
+        dataset=dataset,
+        position_bias_model=pos_model,
+    )
+    feature_pipeline = ReRankFeaturePipeline(
+        dataset=dataset,
+        article_store=article_store,
+        session_extractor=session_extractor,
+        behavioral_extractor=behavioral_extractor,
+    )
+
+    reranker = GBDTReranker.load(model_path)
+    logger.info("Loaded GBDT reranker from %s (%d features)", model_path, len(reranker.feature_names))
+    return TwoStageRetrieveThenRank(feature_pipeline=feature_pipeline, reranker=reranker)
+
+
 def _process_batch(
     batch: list[Impression],
     dataset: str,
@@ -211,13 +298,58 @@ def _process_batch(
     eb_history: MemoryMappedHistoryStore | None,
     history_cap: int,
     handle,
+    reranker_pipeline: TwoStageRetrieveThenRank | None = None,
 ) -> None:
+    """Rank one batch of impressions and write predictions.
+
+    Stage-1: cosine-similarity ranking over the article embedding index.
+    Stage-2 (EB-NeRD only, when reranker_pipeline is set): GBDT re-ranking
+    using the Stage-1 embed scores + behavioral/article/position features.
+    """
     histories = _history_batches(dataset, batch, eb_history)
     candidates = [item.candidates for item in batch]
     vectors = build_mean_user_vectors(histories, index, history_cap=history_cap)
-    ranked = rank_candidate_batch(vectors, candidates, index)
-    for item, ordered in zip(batch, ranked):
-        write_ranked_impression(handle, item.impression_id, item.candidates, ordered)
+
+    if reranker_pipeline is None:
+        # Stage-1 only: pure embedding similarity ranking
+        ranked = rank_candidate_batch(vectors, candidates, index)
+        for item, ordered in zip(batch, ranked):
+            write_ranked_impression(handle, item.impression_id, item.candidates, ordered)
+    else:
+        # Stage-1 + Stage-2: use embed scores from Stage-1 as input to the GBDT
+        from src.retrieval.ann import ArticleIndex as _AI
+        for item, user_vector, hist_list in zip(batch, vectors, histories):
+            cands = item.candidates
+            if not cands:
+                write_ranked_impression(handle, item.impression_id, [], [])
+                continue
+
+            # Stage-1: score all candidates by embedding similarity
+            stage1_results = index.search_restricted(user_vector, cands, k=len(cands))
+            embed_scores: dict[str, float] = {aid: float(score) for aid, score in stage1_results}
+
+            # Stage-2: GBDT reranker using embed_scores as retrieval_embed_sim feature
+            # History entries are dicts with at least "article_id"; no timestamps in test set.
+            user_history = [
+                {"article_id": str(h["article_id"]), "clicked_at": None}
+                for h in hist_list
+                if h.get("article_id")
+            ]
+            as_of = item.timestamp or datetime(2023, 5, 22, 12, 0, 0)
+
+            result = reranker_pipeline.rerank_candidates(
+                user_id=item.user_id,
+                as_of_ts=as_of,
+                candidate_ids=cands,
+                user_history=user_history,
+                user_impressions=[],   # test set has no prior session context
+                current_session_id=None,
+                embed_scores=embed_scores,
+                labels=None,
+            )
+            write_ranked_impression(
+                handle, item.impression_id, item.candidates, result.reranked_candidate_ids
+            )
 
 
 def generate_submission(dataset: str, args: argparse.Namespace) -> tuple[Path, Path, int, float]:
@@ -235,6 +367,14 @@ def generate_submission(dataset: str, args: argparse.Namespace) -> tuple[Path, P
     prediction_path = output_dir / prediction_filename
     zip_path = output_dir / f"{dataset}_submission.zip"
 
+    # Load Stage-2 GBDT reranker pipeline (None for MIND, or if --no-rerank)
+    no_rerank = getattr(args, "no_rerank", False)
+    reranker_pipeline = None if no_rerank else _load_reranker_pipeline(dataset)
+    if reranker_pipeline is not None:
+        logger.info("Stage-2 GBDT reranker active for %s.", dataset)
+    else:
+        logger.info("Stage-1 only (no Stage-2 reranker) for %s.", dataset)
+
     eb_history = None
     if dataset == "ebnerd":
         _, history_path = find_ebnerd_test_files(_PROJECT_ROOT / "data" / "raw" / "ebnerd")
@@ -251,7 +391,10 @@ def generate_submission(dataset: str, args: argparse.Namespace) -> tuple[Path, P
     row_count = 0
     with prediction_path.open("w", encoding="utf-8") as handle:
         for batch in batches:
-            _process_batch(batch, dataset, index, eb_history, args.history_cap, handle)
+            _process_batch(
+                batch, dataset, index, eb_history, args.history_cap, handle,
+                reranker_pipeline=reranker_pipeline,
+            )
             row_count += len(batch)
             if row_count % max(args.batch_size * 5, 100_000) < len(batch):
                 logger.info("Generated %d predictions", row_count)
@@ -271,6 +414,10 @@ def main() -> None:
     parser.add_argument("--embedding-batch-size", type=int, default=256)
     parser.add_argument("--device", default=None, help="sentence-transformers device, e.g. cuda or cpu")
     parser.add_argument("--rebuild-history-index", action="store_true")
+    parser.add_argument(
+        "--no-rerank", action="store_true",
+        help="Skip Stage-2 GBDT reranking (for ablation/debugging — produces Stage-1 only output)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(

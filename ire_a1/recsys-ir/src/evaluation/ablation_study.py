@@ -167,8 +167,11 @@ def run_ablation_and_bootstrap_study(
     beh_path = i_dir / "behaviors.parquet"
 
     if not beh_path.exists() or not (p_dir / "article_features.parquet").exists():
-        logger.warning("Interim data missing. Running calibrated benchmark for statistical study.")
-        return _run_calibrated_q3_study(dataset, b_bootstrap=b_bootstrap)
+        raise FileNotFoundError(
+            f"Interim data missing at {beh_path} (or article_features.parquet in {p_dir}). "
+            f"Run 'make data' and 'make features' first. "
+            f"Check DATA_SCALE — currently configured for scale={scale!r}."
+        )
 
     article_store = ArticleFeatureStore(dataset, processed_dir=p_dir, scale=scale)
     df_beh = pl.read_parquet(beh_path)

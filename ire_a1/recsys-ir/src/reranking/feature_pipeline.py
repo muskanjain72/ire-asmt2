@@ -203,9 +203,12 @@ class ReRankFeaturePipeline:
             # Candidate article & interaction features
             c_feat = cand_behavioral[i]
 
-            # Click-history embedding and title overlap signals
+            # Click-history embedding signals.
+            # If an in-memory article_index was not loaded but the user is warm and Stage-1
+            # embed scores are available, use Stage-1 embedding similarity as a lightweight proxy.
+            # Truly cold users (lifetime_history_len == 0) strictly remain 0.0.
             hist_emb_sim = float(c_feat.user_history_embedding_similarity)
-            if hist_emb_sim == 0.0 and cid in embed_map:
+            if hist_emb_sim == 0.0 and u_summary.lifetime_history_len > 0 and cid in embed_map:
                 hist_emb_sim = float(embed_map[cid])
             hist_max_sim = float(c_feat.user_history_max_embedding_sim)
             if hist_max_sim == 0.0 and hist_emb_sim != 0.0:
