@@ -37,6 +37,10 @@ _OUTPUT_SCHEMA = {
     "clicked_history": pl.Utf8,
     "candidates": pl.Utf8,
     "labels": pl.Utf8,
+    "session_id": pl.Utf8,
+    "read_time": pl.Float32,
+    "scroll_percentage": pl.Float32,
+    "split": pl.Utf8,
 }
 
 
@@ -92,19 +96,23 @@ def parse_ebnerd_articles(raw_dir: Path) -> pl.DataFrame:
     return out
 
 
-def _history_lookup_small(history_path: Path) -> dict[int, list[dict]]:
+def _history_lookup_small(history_path: Path) -> dict[int, str]:
     df = pl.read_parquet(history_path)
+    uids = df["user_id"].to_list()
+    art_ids = df["article_id_fixed"].to_list()
+    time_ids = df["impression_time_fixed"].to_list()
     lookup = {}
-    for row in df.iter_rows(named=True):
+    for uid, aids, times in zip(uids, art_ids, time_ids):
         entries = []
-        for i, aid in enumerate(row.get("article_id_fixed") or []):
-            ts = (row.get("impression_time_fixed") or [None])[i] if i < len(row.get("impression_time_fixed") or []) else None
-            entries.append({"article_id": str(aid), "clicked_at": ts.isoformat() if isinstance(ts, datetime) else None})
-        lookup[int(row["user_id"])] = entries
+        if aids is not None:
+            for j, aid in enumerate(aids):
+                ts = times[j].isoformat() if (times is not None and j < len(times) and isinstance(times[j], datetime)) else None
+                entries.append({"article_id": str(aid), "clicked_at": ts})
+        lookup[int(uid)] = json.dumps(entries, separators=(",", ":"))
     return lookup
 
 
-def _parse_behavior_batch(batch, include_history: bool, history_lookup: dict[int, list[dict]] | None = None) -> pl.DataFrame:
+def _parse_behavior_batch(batch, include_history: bool, history_lookup: dict[int, str] | None = None) -> pl.DataFrame:
     rows = []
     cols = {name: batch.column(i).to_pylist() for i, name in enumerate(batch.schema.names)}
     n = batch.num_rows
@@ -114,15 +122,19 @@ def _parse_behavior_batch(batch, include_history: bool, history_lookup: dict[int
         clicked = set(cols["article_ids_clicked"][i] or [])
         candidates = [str(aid) for aid in inview]
         labels = [1 if aid in clicked else 0 for aid in inview]
-        history = history_lookup.get(int(uid), []) if include_history and history_lookup is not None else []
+        history_str = history_lookup.get(int(uid), "[]") if include_history and history_lookup is not None else "[]"
         rows.append({
             "impression_id": str(cols["impression_id"][i]),
             "dataset": "ebnerd",
             "user_id": str(uid),
             "timestamp": cols["impression_time"][i],
-            "clicked_history": json.dumps(history, separators=(",", ":")),
+            "clicked_history": history_str,
             "candidates": json.dumps(candidates, separators=(",", ":")),
             "labels": json.dumps(labels, separators=(",", ":")),
+            "session_id": str(cols["session_id"][i]) if "session_id" in cols and cols["session_id"][i] is not None else None,
+            "read_time": float(cols["read_time"][i]) if "read_time" in cols and cols["read_time"][i] is not None else None,
+            "scroll_percentage": float(cols["scroll_percentage"][i]) if "scroll_percentage" in cols and cols["scroll_percentage"][i] is not None else None,
+            "split": str(cols["split"][i]) if "split" in cols and cols["split"][i] is not None else "train",
         })
     return pl.DataFrame(rows, schema=_OUTPUT_SCHEMA)
 
@@ -181,21 +193,37 @@ def parse_ebnerd_behaviors(raw_dir: Path, splits: list[str] | None = None) -> tu
         history_lookup = _history_lookup_small(hist_path)
         beh = pl.read_parquet(beh_path)
         stats[split] = beh.height
-        # Convert the entire small/demo split only; this function is not used for EB-large.
-        cols = {name: beh[name].to_list() for name in ["impression_id", "impression_time", "article_ids_inview", "article_ids_clicked", "user_id"]}
-        rows = []
-        for i in range(beh.height):
-            uid = cols["user_id"][i]
-            inview = cols["article_ids_inview"][i] or []
-            clicked = set(cols["article_ids_clicked"][i] or [])
-            rows.append({
-                "impression_id": str(cols["impression_id"][i]),
-                "dataset": "ebnerd", "user_id": str(uid), "timestamp": cols["impression_time"][i],
-                "clicked_history": json.dumps(history_lookup.get(int(uid), []), separators=(",", ":")),
-                "candidates": json.dumps([str(x) for x in inview], separators=(",", ":")),
-                "labels": json.dumps([1 if x in clicked else 0 for x in inview], separators=(",", ":")),
-            })
-        all_frames.append(pl.DataFrame(rows, schema=_OUTPUT_SCHEMA))
+
+        split_label = "val" if split in ("val", "validation") else "train"
+
+        uids = [str(x) for x in beh["user_id"].to_list()]
+        imp_ids = [str(x) for x in beh["impression_id"].to_list()]
+        timestamps = beh["impression_time"].to_list()
+        sess_ids = [str(x) if x is not None else None for x in beh["session_id"].to_list()] if "session_id" in beh.columns else [None] * beh.height
+        read_times = beh["read_time"].to_list() if "read_time" in beh.columns else [None] * beh.height
+        scroll_pcts = beh["scroll_percentage"].to_list() if "scroll_percentage" in beh.columns else [None] * beh.height
+
+        invs = beh["article_ids_inview"].to_list()
+        clicks = [set(clk) if clk is not None else set() for clk in beh["article_ids_clicked"].to_list()]
+
+        cands = [json.dumps([str(x) for x in inv], separators=(",", ":")) for inv in invs]
+        labels = [json.dumps([1 if x in c else 0 for x in inv], separators=(",", ":")) for inv, c in zip(invs, clicks)]
+        histories = [history_lookup.get(int(uid), "[]") for uid in beh["user_id"].to_list()]
+
+        frame = pl.DataFrame({
+            "impression_id": imp_ids,
+            "dataset": ["ebnerd"] * beh.height,
+            "user_id": uids,
+            "timestamp": timestamps,
+            "clicked_history": histories,
+            "candidates": cands,
+            "labels": labels,
+            "session_id": sess_ids,
+            "read_time": read_times,
+            "scroll_percentage": scroll_pcts,
+            "split": [split_label] * beh.height,
+        }, schema=_OUTPUT_SCHEMA)
+        all_frames.append(frame)
     return pl.concat(all_frames), stats
 
 
@@ -268,30 +296,19 @@ def main(splits: list[str] | None = None, scale: str = "small"):
         return articles, None, None, stats
 
     behaviors, stats = parse_ebnerd_behaviors(raw_dir, splits=splits)
-    # Backward-compatible user derivation for small/demo.
-    users = []
-    for r in behaviors.iter_rows(named=True):
-        users.append(r)
-    user_map = {}
-    for r in users:
-        state = user_map.setdefault(r["user_id"], {"user_id": r["user_id"], "dataset": "ebnerd", "history": {}, "last": r["timestamp"]})
-        for e in json.loads(r["clicked_history"]):
-            state["history"].setdefault(e["article_id"], e)
-        state["last"] = max(state["last"], r["timestamp"])
-    user_rows = [
-        {
-            "user_id": v["user_id"], "dataset": "ebnerd",
-            "all_history": json.dumps(list(v["history"].values())),
-            "history_len": len(v["history"]), "last_active_at": v["last"],
-        }
-        for v in user_map.values()
-    ]
-    pl.DataFrame(user_rows, schema={
-        "user_id": pl.Utf8, "dataset": pl.Utf8, "all_history": pl.Utf8,
-        "history_len": pl.Int64, "last_active_at": pl.Datetime("us"),
-    }).write_parquet(out_dir / "users.parquet", compression="zstd")
+    # Fast user derivation
+    user_summary = (
+        behaviors.group_by("user_id").agg([
+            pl.col("clicked_history").first().alias("all_history"),
+            pl.col("timestamp").max().alias("last_active_at"),
+        ]).with_columns([
+            pl.lit("ebnerd").alias("dataset"),
+            pl.col("all_history").map_elements(lambda s: len(json.loads(s or "[]")), return_dtype=pl.Int64).alias("history_len"),
+        ]).select(["user_id", "dataset", "all_history", "history_len", "last_active_at"])
+    )
+    user_summary.write_parquet(out_dir / "users.parquet", compression="zstd")
     behaviors.write_parquet(out_dir / "behaviors.parquet", compression="zstd")
-    return articles, behaviors, users, stats
+    return articles, behaviors, user_summary, stats
 
 
 if __name__ == "__main__":

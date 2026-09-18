@@ -1,0 +1,5 @@
+dataset,configuration,AUC,MRR,nDCG@5,nDCG@10
+mind,Full Model (WITH Position Bias / Offline Observational),0.5639474862374378,0.2822361572327631,0.25485878024004543,0.3155595544452194
+mind,Realistic Serving Pipeline (WITHOUT Position Bias / Anti-Gaming),0.5644942507535814,0.27634996677475243,0.2516393424805694,0.31349056335581327
+mind,Serving-Time Degradation (Delta),0.0005,-0.0059,-0.0032,-0.0021
+mind,Relative Impact (%),0.1,-2.09,-1.26,-0.66

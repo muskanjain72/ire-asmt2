@@ -65,18 +65,33 @@ class ArticleFeatureStore:
             )
         self._store = ParquetStore(self._path, table_alias="articles")
         self._dataset = dataset
+        self._article_cache: dict[str, dict[str, Any]] = {}
 
     # Lookups
 
     def get_article(self, article_id: str) -> dict[str, Any] | None:
         """Return all feature columns for a single article, or ``None``."""
-        return self._store.get_by_id("article_id", article_id)
+        aid = str(article_id)
+        if aid in self._article_cache:
+            return self._article_cache[aid]
+        res = self._store.get_by_id("article_id", aid)
+        if res is not None:
+            self._article_cache[aid] = res
+        return res
 
     def get_articles_batch(
         self, article_ids: list[str], columns: list[str] | None = None
     ) -> list[dict[str, Any]]:
         """Return features for a batch of article IDs."""
-        return self._store.batch_get("article_id", article_ids, columns=columns)
+        if columns is not None:
+            return self._store.batch_get("article_id", article_ids, columns=columns)
+        str_ids = [str(aid) for aid in article_ids]
+        missing = [aid for aid in str_ids if aid not in self._article_cache]
+        if missing:
+            fetched = self._store.batch_get("article_id", missing)
+            for row in fetched:
+                self._article_cache[str(row["article_id"])] = row
+        return [self._article_cache[aid] for aid in str_ids if aid in self._article_cache]
 
     def get_articles_for_bm25(
         self, article_ids: list[str] | None = None
