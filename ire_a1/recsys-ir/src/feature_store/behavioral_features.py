@@ -211,6 +211,7 @@ class BehavioralFeatureExtractor:
         train_inviews: dict[str, int] | None = None,
         history_cap: int = 20,
         article_index: Any | None = None,
+        strict_time: bool = True,
     ) -> None:
         self.dataset = dataset.lower()
         self.article_store = article_store
@@ -219,6 +220,7 @@ class BehavioralFeatureExtractor:
         self.train_inviews = train_inviews or {}
         self.history_cap = history_cap
         self.article_index = article_index
+        self.strict_time = strict_time
 
     def _get_embedding(self, article_id: str) -> np.ndarray | None:
         """Retrieve embedding vector for an article ID from index, dict, or store."""
@@ -439,7 +441,11 @@ class BehavioralFeatureExtractor:
         """
         cands = [str(cid) for cid in candidate_ids]
         meta_rows = self.article_store.get_articles_batch(cands)
-        meta_map = {str(row["article_id"]): row for row in meta_rows}
+        meta_map = {
+            str(row["article_id"]): row
+            for row in meta_rows
+            if row is not None and "article_id" in row
+        }
 
         results = []
         for cid in cands:
@@ -469,7 +475,7 @@ class BehavioralFeatureExtractor:
                     pub_dt = pub_ts
 
                 delta_sec = (as_of_ts - pub_dt).total_seconds()
-                if delta_sec < -86400:
+                if self.strict_time and delta_sec < -86400:
                     raise ValueError(
                         f"Data leakage detected: article {cid} published at {pub_dt} "
                         f"is after as_of_ts {as_of_ts}"

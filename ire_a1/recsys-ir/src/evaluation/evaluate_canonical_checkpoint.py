@@ -49,9 +49,10 @@ logger = logging.getLogger(__name__)
 # Feature groups for Q3 ablation
 ABLATION_GROUPS = {
     "- Category Affinity": [
-        "user_category_affinity",
-        "user_subcategory_affinity",
-        "user_category_clicked_ratio",
+        "article_category_affinity",
+        "article_subcategory_affinity",
+        "article_is_top_category_match",
+        "article_is_top_subcategory_match",
     ],
     "- Position Bias": [
         "position_bias_rank",
@@ -61,11 +62,9 @@ ABLATION_GROUPS = {
         "position_bias_empirical_ctr",
     ],
     "- Freshness & Recency": [
-        "article_age_hours_linear",
-        "article_freshness_decay",
-        "user_history_recency_score",
-        "user_mean_history_age_hours",
-        "user_min_history_age_hours",
+        "user_mean_recency_weight",
+        "article_freshness_hours",
+        "article_freshness_available",
     ],
     "- Session & Dwell": [
         "session_impression_index",
@@ -77,15 +76,14 @@ ABLATION_GROUPS = {
         "session_dwell_available",
     ],
     "- Popularity Prior": [
-        "train_article_inview_log",
-        "train_article_clicks_log",
-        "train_article_smoothed_ctr",
-        "global_ctr_prior",
+        "article_train_pop_clicks_log",
+        "article_train_pop_inviews_log",
+        "article_train_empirical_ctr",
     ],
     "- History Embeddings & Semantic Overlap": [
         "user_history_embedding_similarity",
-        "user_history_max_embedding_similarity",
-        "user_history_semantic_overlap_count",
+        "user_history_max_embedding_sim",
+        "user_history_title_overlap",
     ],
 }
 
@@ -310,7 +308,10 @@ def run_canonical_evaluation(
     ]
 
     for group_name, fnames in ABLATION_GROUPS.items():
-        indices = [FEATURE_NAMES.index(fn) for fn in fnames if fn in FEATURE_NAMES]
+        missing = [fn for fn in fnames if fn not in FEATURE_NAMES]
+        if missing:
+            raise ValueError(f"Feature group '{group_name}' contains invalid feature names: {missing}")
+        indices = [FEATURE_NAMES.index(fn) for fn in fnames]
         abl_means, _ = score_model(mask_indices=indices)
         ablation_rows.append({
             "dataset": dataset,
@@ -350,26 +351,30 @@ def run_canonical_evaluation(
             "excludes_zero": excl,
         })
 
-    # Official NRMS comparison on EB-NeRD
-    # Official NRMS baseline means on EB-NeRD validation:
-    # AUC: 0.5807, MRR: 0.3677, nDCG@5: 0.4007, nDCG@10: 0.4826
-    if dataset == "ebnerd":
-        nrms_means = {"AUC": 0.5807, "MRR": 0.3677, "nDCG@5": 0.4007, "nDCG@10": 0.4826}
-        for metric in ["AUC", "MRR", "nDCG@5", "nDCG@10"]:
-            diffs_nrms = [f - nrms_means[metric] for f in full_metric_lists[metric]]
-            mean_diff, ci_low, ci_high, p_val, excl = compute_paired_bootstrap(diffs_nrms)
-            bootstrap_rows.append({
-                "dataset": dataset,
-                "comparison": "Full Model vs Official NRMS Baseline",
-                "metric": metric,
-                "baseline_mean": nrms_means[metric],
-                "improved_mean": full_means[metric],
-                "mean_gain": mean_diff,
-                "ci_low_95": ci_low,
-                "ci_high_95": ci_high,
-                "p_value": p_val,
-                "excludes_zero": excl,
-            })
+    # Official NRMS comparison
+    # Official NRMS baseline means on validation:
+    # EB-NeRD: AUC: 0.5807, MRR: 0.3677, nDCG@5: 0.4007, nDCG@10: 0.4826
+    # MIND: AUC: 0.6338, MRR: 0.2983, nDCG@5: 0.3226, nDCG@10: 0.3829
+    nrms_means = (
+        {"AUC": 0.5807, "MRR": 0.3677, "nDCG@5": 0.4007, "nDCG@10": 0.4826}
+        if dataset == "ebnerd"
+        else {"AUC": 0.6338, "MRR": 0.2983, "nDCG@5": 0.3226, "nDCG@10": 0.3829}
+    )
+    for metric in ["AUC", "MRR", "nDCG@5", "nDCG@10"]:
+        diffs_nrms = [f - nrms_means[metric] for f in full_metric_lists[metric]]
+        mean_diff, ci_low, ci_high, p_val, excl = compute_paired_bootstrap(diffs_nrms)
+        bootstrap_rows.append({
+            "dataset": dataset,
+            "comparison": "Full Model vs Official NRMS Baseline",
+            "metric": metric,
+            "baseline_mean": nrms_means[metric],
+            "improved_mean": full_means[metric],
+            "mean_gain": mean_diff,
+            "ci_low_95": ci_low,
+            "ci_high_95": ci_high,
+            "p_value": p_val,
+            "excludes_zero": excl,
+        })
 
     df_bootstrap = pl.DataFrame(bootstrap_rows)
     df_bootstrap.write_csv(RESULTS_DIR / f"canonical_paired_bootstrap_{dataset}.csv")
@@ -378,7 +383,10 @@ def run_canonical_evaluation(
     # -------------------------------------------------------------
     # 5. Q9 Anti-Gaming Table (WITH vs WITHOUT Position Bias)
     # -------------------------------------------------------------
-    pos_indices = [FEATURE_NAMES.index(fn) for fn in POSITION_BIAS_FEATURES if fn in FEATURE_NAMES]
+    pos_missing = [fn for fn in POSITION_BIAS_FEATURES if fn not in FEATURE_NAMES]
+    if pos_missing:
+        raise ValueError(f"POSITION_BIAS_FEATURES contains invalid feature names: {pos_missing}")
+    pos_indices = [FEATURE_NAMES.index(fn) for fn in POSITION_BIAS_FEATURES]
     no_pos_means, _ = score_model(mask_indices=pos_indices)
 
     anti_gaming_rows = [

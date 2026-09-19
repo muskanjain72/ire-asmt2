@@ -7,11 +7,15 @@ from typing import TextIO, Sequence
 
 
 def ranked_ids_to_positions(candidate_ids: Sequence[str], ranked_ids: Sequence[str]) -> list[int]:
-    """Convert article ranking into the official 1-based candidate positions."""
-    position = {str(article_id): i + 1 for i, article_id in enumerate(candidate_ids)}
-    if len(position) != len(candidate_ids):
-        raise ValueError("Candidate list contains duplicate article IDs")
-    ranks = [position[str(article_id)] for article_id in ranked_ids]
+    """Convert article ranking into official 1-based candidate ranks matching Codabench format.
+
+    The i-th element of the returned list corresponds to the 1-based rank (1 = best)
+    assigned to the i-th candidate in candidate_ids.
+    """
+    rank_map = {str(article_id): rank + 1 for rank, article_id in enumerate(ranked_ids)}
+    if len(rank_map) != len(ranked_ids):
+        raise ValueError("Ranked list contains duplicate article IDs")
+    ranks = [rank_map[str(article_id)] for article_id in candidate_ids]
     if sorted(ranks) != list(range(1, len(candidate_ids) + 1)):
         raise ValueError("Ranked IDs are not a permutation of the candidate list")
     return ranks

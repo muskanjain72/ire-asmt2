@@ -1,5 +1,5 @@
 dataset,configuration,AUC,MRR,nDCG@5,nDCG@10
-ebnerd,Full Model (WITH Position Bias / Offline Observational),0.6494049988491181,0.41628985473415103,0.4733664634444167,0.5280762792670254
-ebnerd,Realistic Serving Pipeline (WITHOUT Position Bias / Anti-Gaming),0.6295255052695149,0.41110481754282635,0.46397675018722295,0.5201108652425689
-ebnerd,Serving-Time Degradation (Delta),-0.0199,-0.0052,-0.0094,-0.008
-ebnerd,Relative Impact (%),-3.06,-1.25,-1.98,-1.51
+ebnerd,Full Model (WITH Position Bias / Offline Observational),0.6098171602640744,0.3668179269864335,0.41645699327761615,0.4867703500014771
+ebnerd,Realistic Serving Pipeline (WITHOUT Position Bias / Anti-Gaming),0.5669351021658389,0.34706460692941404,0.3873174328206152,0.4633314555656018
+ebnerd,Serving-Time Degradation (Delta),-0.0429,-0.0198,-0.0291,-0.0234
+ebnerd,Relative Impact (%),-7.03,-5.39,-7.0,-4.82
