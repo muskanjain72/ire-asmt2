@@ -124,6 +124,33 @@ validate-ebnerd: ## Validate generated EB-NeRD prediction file and ZIP
 	@unzip -l /tmp/ebnerd_submission_check.zip
 
 # ---------------------------------------------------------------------------
+# Assignment 2 Targets: Two-Stage Re-Ranking, Baselines, Ablation & Benchmark
+# ---------------------------------------------------------------------------
+
+.PHONY: a2 reranker eval-reranker ablation bootstrap serving-benchmark submit-a2
+
+a2: features reranker eval-reranker ablation bootstrap serving-benchmark ## Run entire Assignment 2 pipeline end-to-end
+
+reranker: ## Train Stage-2 GBDT Re-Ranker on EB-NeRD (Question 2)
+	$(PYTHON) -m scripts.train_reranker --dataset ebnerd
+
+eval-reranker: ## Evaluate Stage-2 GBDT Re-Ranker on validation split (Question 2)
+	$(PYTHON) -m scripts.eval_reranker --dataset ebnerd
+
+ablation: ## Run 6-group behavioral ablation study on validation split (Question 3)
+	$(PYTHON) -m src.evaluation.ablation_study --dataset all
+
+bootstrap: ## Run Paired Bootstrap statistical significance testing B=1000 (Question 3 & 5)
+	$(PYTHON) -m src.evaluation.bootstrap
+
+serving-benchmark: ## Run p99 latency, RAM footprint, and QPS benchmark (Question 4)
+	$(PYTHON) -m scripts.benchmark_serving
+
+submit-a2: ## Generate official Codabench competition submissions for both datasets
+	$(PYTHON) -m scripts.generate_ebnerd_gbdt_submission
+	$(PYTHON) -m scripts.generate_mind_nrms_submission
+
+# ---------------------------------------------------------------------------
 # Tests / cleanup
 # ---------------------------------------------------------------------------
 

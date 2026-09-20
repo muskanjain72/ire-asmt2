@@ -51,3 +51,6 @@ logs/*.log
 models/**
 !models/**/.gitkeep
 *.h5
+*.weights.h5
+*.parquet
+*.npy
